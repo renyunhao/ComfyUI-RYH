@@ -13,7 +13,6 @@ const EXTENSION_NAME = "ComfyUI-RYH.LoadImageAtFolder";
 const NODE_CLASS = "LoadImageAtFolder";
 
 const isZH = navigator.language.startsWith("zh");
-const PREVIEW_MAX_H = 280; // 预览区最大高度（节点宽度不变时，超高图片等比缩放上限）
 
 // ---------- 通用小工具 ----------
 
@@ -27,11 +26,6 @@ function chainCallback(object, property, callback) {
     } else {
         object[property] = callback;
     }
-}
-
-function fitHeight(node) {
-    node.setSize([node.size[0], node.computeSize([node.size[0], node.size[1]])[1]]);
-    node?.graph?.setDirtyCanvas(true);
 }
 
 // 允许从 DOM 预览区域拖拽移动节点
@@ -78,10 +72,12 @@ function setupNode(node) {
     node._ryhFolderWidget = folderWidget;
     node._ryhImageWidget = imageWidget;
 
-    // —— 预览区（DOM widget，等比缩放）——
+    // —— 预览区（DOM widget，可伸缩、随节点高度变化）——
+    // 高度交给布局引擎自动分配：不覆盖 computeSize，保留内置 computeLayoutSize，
+    // 布局引擎会把节点“剩余高度”分配给它；--comfy-widget-min-height 保证最小高度。
     const container = document.createElement("div");
     container.style.cssText =
-        "width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;background:rgba(0,0,0,0.25);";
+        "width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;background:rgba(0,0,0,0.25);--comfy-widget-min-height:60;";
     container.hidden = true;
     const img = document.createElement("img");
     img.style.cssText = "display:block;max-width:100%;max-height:100%;object-fit:contain;";
@@ -93,13 +89,6 @@ function setupNode(node) {
         hideOnZoom: false,
     });
     allowDragFromWidget(previewWidget);
-    previewWidget.computeSize = function (width) {
-        if (container.hidden || !img.naturalWidth) return [width, -4];
-        const ratio = img.naturalWidth / img.naturalHeight;
-        const h = Math.min((node.size[0] - 20) / ratio + 10, PREVIEW_MAX_H + 10);
-        return [width, Math.max(h, 40)];
-    };
-    img.onload = () => fitHeight(node);
     node._ryhPreview = { container, img, widget: previewWidget };
 
     // —— 控制按钮栏：◀ ▶ 计数 [📁 目录] ——
@@ -218,7 +207,6 @@ async function updatePreview(node) {
         pv.img.removeAttribute("src");
         pv.container.style.display = "none";
         pv.container.hidden = true;
-        fitHeight(node);
         return;
     }
     try {
@@ -238,7 +226,25 @@ async function updatePreview(node) {
         pv.container.style.display = "none";
         pv.container.hidden = true;
     }
-    fitHeight(node);
+}
+
+// 可见地提示错误（优先 ComfyUI toast，失败则用浏览器弹窗）
+function showError(msg) {
+    console.warn("[LoadImageAtFolder]", msg);
+    try {
+        const toast = window.app?.extensionManager?.toast;
+        if (toast && typeof toast.add === "function") {
+            toast.add({ severity: "error", summary: "LoadImageAtFolder", detail: msg, life: 6000 });
+            return;
+        }
+    } catch (e) {
+        /* 忽略 toast 兼容问题，回退弹窗 */
+    }
+    try {
+        window.alert(msg);
+    } catch (e) {
+        /* ignore */
+    }
 }
 
 async function browseFolder(node) {
@@ -250,7 +256,7 @@ async function browseFolder(node) {
             node.setDirtyCanvas?.(true, true);
             await refreshImageList(node);
         } else if (data?.error) {
-            console.warn("[LoadImageAtFolder]", data.error);
+            showError(data.error);
         }
     } catch (e) {
         console.warn("[LoadImageAtFolder] 目录选择失败", e);
@@ -268,20 +274,18 @@ app.registerExtension({
         return node;
     },
 
-    // 兼容旧前端：onNodeCreated 原型钩子
-    async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== NODE_CLASS) return;
-        const onNodeCreated = nodeType.prototype.onNodeCreated;
-        nodeType.prototype.onNodeCreated = function (...args) {
-            const r = onNodeCreated ? onNodeCreated.apply(this, args) : undefined;
-            setupNode(this);
-            return r;
-        };
+    // 工作流中节点配置完成（widget 值已恢复）后调用 —— 刷新图片列表的最可靠时机
+    loadedGraphNode(node) {
+        if (node.comfyClass !== NODE_CLASS) return node;
+        setupNode(node);
+        refreshImageList(node);
+        return node;
     },
 
-    // 工作流加载完成（widget 值已恢复）后再刷新一次，确保目录/图片正确
-    afterConfigureGraph(graph) {
-        const g = graph || app.graph;
+    // 工作流加载完成后再兜底刷新一次。
+    // 注意：该钩子的第一个参数是 missingNodeTypes 数组，不是 graph！
+    afterConfigureGraph() {
+        const g = app.graph;
         for (const node of g?._nodes ?? []) {
             if (node.comfyClass !== NODE_CLASS) continue;
             setupNode(node);
