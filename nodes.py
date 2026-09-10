@@ -52,11 +52,11 @@ class LoadImageAtFolder:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("image", "mask")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING")
+    RETURN_NAMES = ("image", "mask", "image_path", "image_name")
     FUNCTION = "load_image"
     CATEGORY = "image/loaders"
-    DESCRIPTION = "从任意目录加载一张图片，支持目录选择、◀ ▶ 快速切换与节点内预览；选择 none 时输出空张量。"
+    DESCRIPTION = "从任意目录加载一张图片，支持目录选择、◀ ▶ 快速切换与节点内预览；选择 none 时输出空张量。额外输出图片完整路径与文件名。"
 
     @classmethod
     def VALIDATE_INPUTS(cls, **kwargs):
@@ -69,14 +69,19 @@ class LoadImageAtFolder:
             return (
                 torch.zeros((0, 3, 8, 8), dtype=torch.float32),
                 torch.zeros((0, 8, 8), dtype=torch.float32),
+                "",
+                "",
             )
 
         image_path = os.path.join(folder, image)
+        file_name = os.path.splitext(os.path.basename(image))[0]
         if not os.path.isfile(image_path):
             print(f"[LoadImageAtFolder] 图片不存在: {image_path}，输出空张量。")
             return (
                 torch.zeros((0, 3, 8, 8), dtype=torch.float32),
                 torch.zeros((0, 8, 8), dtype=torch.float32),
+                "",
+                "",
             )
 
         img = node_helpers.pillow(Image.open, image_path)
@@ -94,4 +99,4 @@ class LoadImageAtFolder:
             mask = torch.zeros((64, 64), dtype=torch.float32)
 
         img.close()
-        return (image_tensor, mask)
+        return (image_tensor, mask, image_path, file_name)
