@@ -28,6 +28,32 @@ def list_images_in_folder(folder):
     return sorted(names, key=str.lower)
 
 
+def resolve_image_path(folder, image):
+    """把 image 输入值解析为绝对路径。
+
+    兼容三种取值：
+    1. 绝对路径 -> 原样使用；
+    2. 裸文件名 -> 与 folder 拼接（节点自身下拉列表的行为）；
+    3. 含目录分隔符的路径 -> 先尝试相对 folder，不存在再按相对
+       ComfyUI input 根目录解析（批量工具下拉注入的是这种路径）。
+    """
+    if not image:
+        return ""
+    if os.path.isabs(image):
+        return os.path.normpath(image)
+    if "/" in image or os.path.sep in image:
+        folder_candidate = os.path.normpath(os.path.join(folder, image))
+        if os.path.isfile(folder_candidate):
+            return folder_candidate
+        input_candidate = os.path.normpath(
+            os.path.join(folder_paths.get_input_directory(), image)
+        )
+        if os.path.isfile(input_candidate):
+            return input_candidate
+        return folder_candidate
+    return os.path.normpath(os.path.join(folder, image))
+
+
 class LoadImageAtFolder:
     @classmethod
     def INPUT_TYPES(cls):
@@ -73,7 +99,7 @@ class LoadImageAtFolder:
                 "",
             )
 
-        image_path = os.path.join(folder, image)
+        image_path = resolve_image_path(folder, image)
         file_name = os.path.splitext(os.path.basename(image))[0]
         if not os.path.isfile(image_path):
             print(f"[LoadImageAtFolder] 图片不存在: {image_path}，输出空张量。")

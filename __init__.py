@@ -9,7 +9,7 @@ import os
 from aiohttp import web
 from server import PromptServer
 
-from .nodes import LoadImageAtFolder, list_images_in_folder
+from .nodes import LoadImageAtFolder, list_images_in_folder, resolve_image_path
 
 NODE_CLASS_MAPPINGS = {
     "LoadImageAtFolder": LoadImageAtFolder,
@@ -65,8 +65,8 @@ async def ryh_image(request):
     """返回目录下指定图片的原始字节，供前端节点内预览。"""
     folder = request.query.get("folder", "")
     image = request.query.get("image", "")
-    path = os.path.join(folder, image)
-    if not os.path.isfile(path):
+    path = resolve_image_path(folder, image)
+    if not path or not os.path.isfile(path):
         return web.Response(status=404, text="file not found")
     return web.FileResponse(path)
 
