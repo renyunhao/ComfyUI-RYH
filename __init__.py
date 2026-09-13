@@ -2,6 +2,7 @@
 
 当前节点：
 - LoadImageAtFolder：从任意目录加载一张图片（目录选择 / ◀ ▶ 切换 / 节点内等比预览）。
+- ExtractMetadata：解析视频/图片中的 metadata，输出 prompt 与 workflow。
 """
 
 import os
@@ -9,14 +10,16 @@ import os
 from aiohttp import web
 from server import PromptServer
 
-from .nodes import LoadImageAtFolder, list_images_in_folder, resolve_image_path
+from .nodes import ExtractMetadata, LoadImageAtFolder, list_images_in_folder, resolve_image_path
 
 NODE_CLASS_MAPPINGS = {
     "LoadImageAtFolder": LoadImageAtFolder,
+    "ExtractMetadata": ExtractMetadata,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadImageAtFolder": "Load Image At Folder (RYH)",
+    "ExtractMetadata": "Extract Metadata (RYH)",
 }
 
 WEB_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js")
