@@ -63,6 +63,30 @@ async def ryh_choose_folder(request):
         return web.json_response({"path": "", "error": f"目录选择失败: {e}"})
 
 
+@PromptServer.instance.routes.post("/ryh/choose_file")
+async def ryh_choose_file(request):
+    """弹出原生文件选择对话框（tkinter），返回所选文件路径。"""
+    if not HAS_TKINTER:
+        return web.json_response(
+            {"path": "", "error": "当前环境缺少 tkinter 弹窗依赖，请直接在输入框中填写文件路径。"}
+        )
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        filetypes = [
+            ("ComfyUI metadata 文件", "*.mp4 *.webm *.mkv *.mov *.png *.webp *.jpg *.jpeg *.gif *.bmp *.tif *.tiff"),
+            ("视频文件", "*.mp4 *.webm *.mkv *.mov *.m4v *.avi *.flv *.wmv"),
+            ("图片文件", "*.png *.webp *.jpg *.jpeg *.gif *.bmp *.tif *.tiff"),
+            ("所有文件", "*.*"),
+        ]
+        path = filedialog.askopenfilename(title="选择视频或图片文件", filetypes=filetypes)
+        root.destroy()
+        return web.json_response({"path": path or ""})
+    except Exception as e:
+        return web.json_response({"path": "", "error": f"文件选择失败: {e}"})
+
+
 @PromptServer.instance.routes.get("/ryh/image")
 async def ryh_image(request):
     """返回目录下指定图片的原始字节，供前端节点内预览。"""
