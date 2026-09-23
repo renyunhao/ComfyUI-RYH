@@ -88,11 +88,11 @@ class LoadImageAtFolder:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING")
-    RETURN_NAMES = ("image", "mask", "image_path", "image_name")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("image", "mask", "image_path", "image_name", "folder_name")
     FUNCTION = "load_image"
     CATEGORY = "image/loaders"
-    DESCRIPTION = "从任意目录加载一张图片，支持目录选择、◀ ▶ 快速切换与节点内预览；选择 none 时输出空张量。额外输出图片完整路径与文件名。"
+    DESCRIPTION = "从任意目录加载一张图片，支持目录选择、◀ ▶ 快速切换与节点内预览；选择 none 时输出空张量。额外输出图片完整路径、文件名与所选目录的最后一级文件夹名。"
 
     @classmethod
     def VALIDATE_INPUTS(cls, **kwargs):
@@ -107,9 +107,13 @@ class LoadImageAtFolder:
                 torch.zeros((0, 8, 8), dtype=torch.float32),
                 "",
                 "",
+                "",
             )
 
+        # folder_name 从解析后的图片路径取，兼容 image 被 xyz 等外部插件
+        # 直接覆盖为完整路径（此时 folder 输入并未同步变化）的情况
         image_path = resolve_image_path(folder, image)
+        folder_name = os.path.basename(os.path.dirname(image_path)) if image_path else ""
         file_name = os.path.splitext(os.path.basename(image))[0]
         if not os.path.isfile(image_path):
             print(f"[LoadImageAtFolder] 图片不存在: {image_path}，输出空张量。")
@@ -118,6 +122,7 @@ class LoadImageAtFolder:
                 torch.zeros((0, 8, 8), dtype=torch.float32),
                 "",
                 "",
+                folder_name,
             )
 
         img = node_helpers.pillow(Image.open, image_path)
@@ -135,7 +140,7 @@ class LoadImageAtFolder:
             mask = torch.zeros((64, 64), dtype=torch.float32)
 
         img.close()
-        return (image_tensor, mask, image_path, file_name)
+        return (image_tensor, mask, image_path, file_name, folder_name)
 
 
 def _find_ffprobe():
