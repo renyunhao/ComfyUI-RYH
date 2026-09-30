@@ -11,6 +11,7 @@ from aiohttp import web
 from server import PromptServer
 
 from .nodes import ExtractMetadata, LoadImageAtFolder, list_images_in_folder, resolve_image_path
+from . import caption_cache
 
 NODE_CLASS_MAPPINGS = {
     "LoadImageAtFolder": LoadImageAtFolder,
@@ -99,3 +100,31 @@ async def ryh_image(request):
 
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+
+
+def _install_caption_cache():
+    """在全部 custom node 加载完成后再给 comfyui-llama-TE 装缓存 patch。
+
+    加载顺序不保证（依赖 os.listdir），因此挂到 aiohttp 的 on_startup：
+    它在 init_extra_nodes 之后、服务开始前触发，此时 llama-TE 模块必然已导入。
+    """
+    try:
+        PromptServer.instance.app.on_startup.append(_on_startup_apply_cache)
+    except Exception as e:
+        # 兜底：拿不到 app 时直接尝试安装（幂等，且失败不影响启动）
+        print(f"[ComfyUI-RYH] on_startup 注册失败，直接尝试安装缓存: {e}")
+        try:
+            caption_cache.apply_patch()
+        except Exception as e2:
+            print(f"[ComfyUI-RYH] 反推缓存 patch 安装失败，已跳过（不影响正常使用）: {e2}")
+
+
+async def _on_startup_apply_cache(_app):
+    # patch 失败绝不能影响 ComfyUI 启动（例如第三方节点结构变化时）
+    try:
+        caption_cache.apply_patch()
+    except Exception as e:
+        print(f"[ComfyUI-RYH] 反推缓存 patch 安装失败，已跳过（不影响正常使用）: {e}")
+
+
+_install_caption_cache()
