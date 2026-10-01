@@ -112,6 +112,9 @@ function setupNode(node) {
     counter.style.cssText = "font-size:11px;color:#aaa;padding:0 2px;white-space:nowrap;";
     counter.textContent = "0/0";
     bar.appendChild(counter);
+    const delBtn = makeBtn(isZH ? "🗑 删除" : "🗑 Delete", () => deleteImage(node));
+    delBtn.style.color = "#e06c6c";
+    node._ryhDeleteBtn = delBtn;
     makeBtn(isZH ? "📁 目录" : "📁 Folder", () => browseFolder(node));
 
     const controlsWidget = node.addDOMWidget("ryh_controls", "controls", bar, {
@@ -136,7 +139,7 @@ function setupNode(node) {
     refreshImageList(node);
 }
 
-async function refreshImageList(node) {
+async function refreshImageList(node, preferred) {
     const folder = node._ryhFolderWidget?.value ?? "";
     node._ryhLastFolder = folder;
 
@@ -161,7 +164,9 @@ async function refreshImageList(node) {
 
     const w = node._ryhImageWidget;
     if (w.options) w.options.values = ["none", ...images];
-    if (!(w.value === "none" || images.includes(w.value))) {
+    if (preferred && images.includes(preferred)) {
+        w.value = preferred;
+    } else if (!(w.value === "none" || images.includes(w.value))) {
         w.value = "none";
     }
     updateCounter(node);
@@ -176,6 +181,41 @@ function updateCounter(node) {
     if (node._ryhCounter) {
         node._ryhCounter.textContent = `${idx === -1 ? 0 : idx + 1}/${imgs.length}`;
     }
+    if (node._ryhDeleteBtn) {
+        node._ryhDeleteBtn.disabled = idx === -1;
+    }
+}
+
+async function deleteImage(node) {
+    const w = node._ryhImageWidget;
+    const folder = node._ryhFolderWidget?.value ?? "";
+    const image = w?.value ?? "none";
+    if (!image || image === "none") return;
+    const confirmed = window.confirm(
+        isZH ? `确定删除图片 "${image}" ？\n该操作会直接从磁盘移除文件，不可恢复！`
+             : `Delete image "${image}"?\nThis permanently removes the file from disk.`
+    );
+    if (!confirmed) return;
+    // 删除后优先显示下一张，没有则显示上一张，都为空时回到 none
+    const imgs = node._ryhImages || [];
+    const idx = imgs.indexOf(image);
+    const preferred = idx === -1 ? "none" : (imgs[idx + 1] ?? imgs[idx - 1] ?? "none");
+    try {
+        const res = await api.fetchApi("/ryh/delete_image", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ folder, image }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) {
+            showError(data.error || `删除失败 (HTTP ${res.status})`);
+            return;
+        }
+    } catch (e) {
+        showError(`删除请求失败: ${e}`);
+        return;
+    }
+    await refreshImageList(node, preferred);
 }
 
 function stepImage(node, dir) {

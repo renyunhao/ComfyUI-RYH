@@ -88,6 +88,27 @@ async def ryh_choose_file(request):
         return web.json_response({"path": "", "error": f"文件选择失败: {e}"})
 
 
+@PromptServer.instance.routes.post("/ryh/delete_image")
+async def ryh_delete_image(request):
+    """删除目录下的指定图片文件（LoadImageAtFolder 节点前端删除按钮调用）。"""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    folder = data.get("folder", "")
+    image = data.get("image", "")
+    if not image or image == "none":
+        return web.json_response({"ok": False, "error": "未选择图片，无法删除。"})
+    path = resolve_image_path(folder, image)
+    if not path or not os.path.isfile(path):
+        return web.json_response({"ok": False, "error": f"文件不存在: {path}"})
+    try:
+        os.remove(path)
+    except OSError as e:
+        return web.json_response({"ok": False, "error": f"删除失败: {e}"})
+    return web.json_response({"ok": True, "path": path})
+
+
 @PromptServer.instance.routes.get("/ryh/image")
 async def ryh_image(request):
     """返回目录下指定图片的原始字节，供前端节点内预览。"""
