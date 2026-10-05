@@ -54,7 +54,7 @@ def _load_disk():
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        print(f"{LOG_PREFIX} 缓存文件损坏，已忽略并重建: {e}")
+        print(f"{LOG_PREFIX} 缓存文件损坏，已忽略并重建: {e}", flush=True)
         return {"version": _CACHE_VERSION, "entries": {}}
     if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
         return {"version": _CACHE_VERSION, "entries": {}}
@@ -104,7 +104,7 @@ def put(key, result, meta=None):
         try:
             _save_disk()
         except OSError as e:
-            print(f"{LOG_PREFIX} 缓存写盘失败: {e}")
+            print(f"{LOG_PREFIX} 缓存写盘失败: {e}", flush=True)
 
 
 def clear():
@@ -115,7 +115,7 @@ def clear():
         try:
             _save_disk()
         except OSError as e:
-            print(f"{LOG_PREFIX} 清空缓存写盘失败: {e}")
+            print(f"{LOG_PREFIX} 清空缓存写盘失败: {e}", flush=True)
 
 
 def _now():
@@ -296,16 +296,26 @@ def build_key(kwargs, target):
 # 懒加载代理：让“模型加载器”节点先返回占位对象，真正加载推迟到首次访问
 # ---------------------------------------------------------------------------
 
+# 懒代理的属性访问策略（白名单）：
+# ComfyUI 内部多处会对节点输出做鸭子类型探测（如 model_patcher.PromptModelTracker
+# 的 getattr(output, "patcher", None)、caching.all_outputs_dynamic 的
+# hasattr(output, "is_dynamic")）。真实模型对象上并不存在这些属性，探测本应拿到
+# 默认值；若让它们走到 resolve()，就会在“缓存命中、本不该加载”时白白触发 GGUF
+# 进显存。因此：未解析的代理只允许访问真实模型类上确定存在的属性（dataclass 字段
+# + 类方法/dunder），其余一律抛 AttributeError，使探测安全地返回默认值。
+# 一旦代理已解析（模型已真实加载），则无条件委托，行为与原版一致。
+
 class _LazyQwenModel:
     """包装 comfyui-llama-TE 的模型对象，延迟到真正需要时才加载 GGUF。
 
     - 缓存命中路径：`run` 里只读取 `_ryh_config`（普通实例属性，不触发加载）后
       直接返回，代理永远不会被解析，模型不进显存。
-    - 其它任何属性访问（含第三方多轮对话等消费者）：自动解析为真实模型并委托，
-      行为对上层透明。
+    - 第三方消费者（多轮对话等）访问 `llm`/`settings` 等真实字段：自动解析并委托。
+    - ComfyUI 记账/回收的探测属性（`patcher`/`is_dynamic` 等）：不解析、抛
+      AttributeError，探测拿到默认值。
     """
 
-    def __init__(self, config, storage_cls, real_loader, prev_model=None):
+    def __init__(self, config, storage_cls, real_loader, prev_model=None, real_cls=None):
         self.__dict__["_ryh_config"] = config
         self.__dict__["_ryh_storage_cls"] = storage_cls
         self.__dict__["_ryh_real_loader"] = real_loader
@@ -314,6 +324,12 @@ class _LazyQwenModel:
         # resolve 时把它放回 cls.model，让原 load 决定复用还是先 unload，
         # 避免“代理覆盖 cls.model 后旧模型失去引用而泄漏显存”。
         self.__dict__["_ryh_prev"] = prev_model
+        # 允许触发解析的属性集合：仅真实模型类的 dataclass 字段（如 llm/settings/
+        # chat_handler）。不纳入 dir() 的 dunder/继承名，避免 str()/repr/序列化等
+        # 探测误触发加载。拿不到真实类时退回到已知字段名，避免白名单为空导致
+        # 合法消费者（多轮对话等）拿不到模型。
+        allowed = set(getattr(real_cls, "__annotations__", ()))
+        self.__dict__["_ryh_allowed"] = allowed or {"llm", "settings", "chat_handler"}
 
     def resolve(self):
         """真正加载并返回底层模型对象（幂等，且与 _QwenStorage.model 保持同步）。"""
@@ -324,6 +340,12 @@ class _LazyQwenModel:
         # 已解析且仍是全局当前模型：直接复用
         if real is not None and cur is real:
             return real
+        # 诊断：走到这里说明确实要触发真实加载，打印调用栈方便定位触发者
+        import traceback
+
+        frames = traceback.extract_stack()[:-2]
+        tail = " <- ".join(f"{fr.filename.rsplit(os.sep, 1)[-1]}:{fr.lineno} {fr.name}" for fr in frames[-4:])
+        print(f"{LOG_PREFIX} [诊断] 代理被解析，触发真实模型加载。调用链: {tail}", flush=True)
         # 选出“上一个真实模型”交给原 load：配置一致则复用、不一致则原 load
         # 会先 unload 再加载，避免显存泄漏。
         if cur is self:
@@ -337,8 +359,19 @@ class _LazyQwenModel:
         return self.__dict__["_ryh_real"]
 
     def __getattr__(self, name):
-        # 只有常规查找失败时才会走到这里（_ryh_* 都在 __dict__ 中，不会进来）
-        return getattr(self.resolve(), name)
+        # _ryh_* 都在 __dict__ 中，不会走到这里。
+        # 未解析状态：只有真实模型的 dataclass 字段（llm/settings/chat_handler）才
+        # 触发加载——这是多轮对话等真实消费者的访问方式。ComfyUI 内部对节点输出的
+        # 鸭子探测（patcher / get_models / is_dynamic 等）不属于这些字段，一律抛
+        # AttributeError 让探测安全拿到默认值，从而“缓存命中时不加载模型”。
+        if name in self.__dict__["_ryh_allowed"]:
+            return getattr(self.resolve(), name)
+        # 已解析（模型确已加载）：无条件委托真实对象，行为与原版一致。真实对象
+        # 没有的属性（含上述探测名）自然抛 AttributeError，不会二次加载。
+        real = self.__dict__["_ryh_real"]
+        if real is not None:
+            return getattr(real, name)
+        raise AttributeError(name)
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +480,8 @@ def _install_qwen_patch(mod):
     #    同时把代理记录到 cls.model，使直接读取 _QwenStorage.model 的消费者
     #    （如多轮对话的 _同步Qwen模型）行为不变：首次访问属性时自动触发真实加载。
     original_storage_load = storage.load.__func__  # classmethod 的底层函数
+    # 真实模型类：其 dataclass 注解字段即“允许触发加载”的属性白名单。
+    real_cls = getattr(mod, "_QwenModel", None)
 
     def lazy_load(cls, config):
         cur = cls.model
@@ -460,13 +495,30 @@ def _install_qwen_patch(mod):
             prev = cur._ryh_real if cur._ryh_real is not None else cur._ryh_prev
         else:
             prev = None
-        proxy = _LazyQwenModel(config, cls, lambda cfg: original_storage_load(cls, cfg), prev)
+        proxy = _LazyQwenModel(
+            config, cls, lambda cfg: original_storage_load(cls, cfg), prev, real_cls=real_cls
+        )
         cls.model = proxy
         return proxy
 
     storage.load = classmethod(lazy_load)
 
-    # 2) 包装 QwenTE图像推理.run：命中直接返回；未命中先解析代理再调原方法
+    # 2) 包装 _QwenStorage.unload：原实现第一行就访问 cls.model.llm 来 close。
+    #    若此时 cls.model 仍是未解析的懒代理（例如工作流里的“卸载显存模型”节点
+    #    在缓存命中运行中被执行），访问 .llm 会触发 resolve，出现“为卸载而加载”
+    #    的反效果。这里先把代理还原成它背后真正持有（或曾持有）的模型再卸载；
+    #    从未解析过的代理没有真实模型可卸，置 None 后原 unload 自然变成空操作。
+    original_storage_unload = storage.unload.__func__
+
+    def safe_unload(cls):
+        cur = cls.model
+        if isinstance(cur, _LazyQwenModel):
+            cls.model = cur._ryh_real if cur._ryh_real is not None else cur._ryh_prev
+        original_storage_unload(cls)
+
+    storage.unload = classmethod(safe_unload)
+
+    # 3) 包装 QwenTE图像推理.run：命中直接返回；未命中先解析代理再调原方法
     original_run = infer_cls.run
 
     def cached_run(self, *args, **kwargs):
@@ -477,7 +529,7 @@ def _install_qwen_patch(mod):
         key, meta = build_key_parts(kwargs, _QWEN_KEY_CFG)
         cached = get(key)
         if cached is not None:
-            print(f"{LOG_PREFIX} [QwenTE] 命中缓存，跳过反推（模型未加载）。")
+            print(f"{LOG_PREFIX} [QwenTE] 命中缓存，跳过反推（模型未加载）。", flush=True)
             return (cached,)
 
         # 未命中：把懒代理解析成真实模型，避免原 run 内部触发二次加载
@@ -487,12 +539,12 @@ def _install_qwen_patch(mod):
         result = original_run(self, *args, **kwargs)
         if isinstance(result, tuple) and len(result) == 1 and isinstance(result[0], str):
             put(key, result[0], meta=meta)
-            print(f"{LOG_PREFIX} [QwenTE] 未命中，已写入缓存。")
+            print(f"{LOG_PREFIX} [QwenTE] 未命中，已写入缓存。", flush=True)
         return result
 
     infer_cls.run = cached_run
     setattr(infer_cls, _PATCHED_FLAG, True)
-    print(f"{LOG_PREFIX} 已为 comfyui-llama-TE 安装反推缓存 patch。")
+    print(f"{LOG_PREFIX} 已为 comfyui-llama-TE 安装反推缓存 patch。", flush=True)
     return True
 
 
@@ -548,7 +600,7 @@ def _install_xb_patch(mod):
             uid = params.get("state_uid", None)
             if uid in (None, -1):
                 uid = str(kwargs.get("unique_id", "0")).rpartition(".")[-1]
-            print(f"{LOG_PREFIX} [XB_llama] 命中缓存，跳过反推（模型未加载）。")
+            print(f"{LOG_PREFIX} [XB_llama] 命中缓存，跳过反推（模型未加载）。", flush=True)
             return (cached.get("out1", ""), cached.get("out2", []), uid)
 
         # 未命中：懒加载模式下确保模型就绪。llama_model 为 dict/list 时是本地
@@ -569,12 +621,12 @@ def _install_xb_patch(mod):
                 },
                 meta=meta,
             )
-            print(f"{LOG_PREFIX} [XB_llama] 未命中，已写入缓存。")
+            print(f"{LOG_PREFIX} [XB_llama] 未命中，已写入缓存。", flush=True)
         return result
 
     infer_cls.process = cached_process
     setattr(infer_cls, _PATCHED_FLAG, True)
-    print(f"{LOG_PREFIX} 已为 XB_ToolBox 安装反推缓存 patch。")
+    print(f"{LOG_PREFIX} 已为 XB_ToolBox 安装反推缓存 patch。", flush=True)
     return True
 
 
@@ -616,10 +668,10 @@ def apply_patch():
         try:
             mod = target["find"]()
             if mod is None:
-                print(f"{LOG_PREFIX} 未检测到 {target['name']}，跳过该目标。")
+                print(f"{LOG_PREFIX} 未检测到 {target['name']}，跳过该目标。", flush=True)
                 continue
             if target["install"](mod):
                 applied = True
         except Exception as e:
-            print(f"{LOG_PREFIX} {target['name']} patch 安装失败，已跳过: {e}")
+            print(f"{LOG_PREFIX} {target['name']} patch 安装失败，已跳过: {e}", flush=True)
     return applied
