@@ -89,7 +89,7 @@ class LoadImageAtFolder:
         }
 
     RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("image", "mask", "image_path", "folder_name", "image_name")
+    RETURN_NAMES = ("image", "mask", "image_path", "folder_name", "file_name")
     FUNCTION = "load_image"
     CATEGORY = "image/loaders"
     DESCRIPTION = "从任意目录加载一张图片，支持目录选择、◀ ▶ 快速切换与节点内预览；选择 none 时输出空张量。额外输出图片完整路径、文件名与所选目录的最后一级文件夹名。"
@@ -146,7 +146,7 @@ class LoadImageAtFolder:
             image_tensor.ryh_source_path = image_path
         except Exception:
             pass
-        return (image_tensor, mask, image_path, file_name, folder_name)
+        return (image_tensor, mask, image_path, folder_name, file_name)
 
 
 def _find_ffprobe():
