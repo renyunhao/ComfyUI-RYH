@@ -89,7 +89,7 @@ class LoadImageAtFolder:
         }
 
     RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("image", "mask", "image_path", "image_name", "folder_name")
+    RETURN_NAMES = ("image", "mask", "image_path", "folder_name", "image_name")
     FUNCTION = "load_image"
     CATEGORY = "image/loaders"
     DESCRIPTION = "从任意目录加载一张图片，支持目录选择、◀ ▶ 快速切换与节点内预览；选择 none 时输出空张量。额外输出图片完整路径、文件名与所选目录的最后一级文件夹名。"
@@ -140,6 +140,12 @@ class LoadImageAtFolder:
             mask = torch.zeros((64, 64), dtype=torch.float32)
 
         img.close()
+        # 把来源路径挂到 tensor 上（仅作元数据）：下游 caption_cache 会把
+        # 它记录进缓存条目的 meta，方便人工核对；不参与缓存 key 计算。
+        try:
+            image_tensor.ryh_source_path = image_path
+        except Exception:
+            pass
         return (image_tensor, mask, image_path, file_name, folder_name)
 
 

@@ -173,6 +173,8 @@ def _params_fingerprint(kwargs, skip_keys):
 
     嵌套在 parameters 字典里的 state_uid 只控制对话状态、不影响单张图的反推
     文本，这里一并剔除。
+
+    返回 (指纹哈希, 规范化后的参数字典)；字典供写入缓存 meta 时原样留档。
     """
     fp = {}
     for k, v in kwargs.items():
@@ -181,23 +183,31 @@ def _params_fingerprint(kwargs, skip_keys):
         if isinstance(v, dict):
             v = {kk: vv for kk, vv in v.items() if kk != "state_uid"}
         fp[k] = v
-    return hashlib.sha256(
+    digest = hashlib.sha256(
         json.dumps(fp, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
     ).hexdigest()
+    return digest, fp
 
 
-def _model_fingerprint(model):
-    """从模型输入提取配置指纹，兼容三种形态：
+def _model_config(model):
+    """归一化模型输入的“配置”形态，兼容：
 
     - 懒代理（QwenTE）：读 _ryh_config；
     - 真实模型对象（QwenTE）：读 settings；
-    - 纯配置 dict / list / str（XB 本地 config 或在线 API JSON）：直接哈希。
+    - 纯配置 dict / list / str（XB 本地 config 或在线 API JSON）：原样返回。
+    无法识别时返回 None。
     """
     cfg = getattr(model, "_ryh_config", None)
     if cfg is None:
         cfg = getattr(model, "settings", None)
     if cfg is None and isinstance(model, (dict, list, str)):
         cfg = model
+    return cfg
+
+
+def _model_fingerprint(model):
+    """模型配置指纹哈希；无法识别时返回 "unknown-model"。"""
+    cfg = _model_config(model)
     if cfg is None:
         return "unknown-model"
     return hashlib.sha256(
@@ -205,15 +215,77 @@ def _model_fingerprint(model):
     ).hexdigest()
 
 
+def _model_name(model):
+    """尽力提取模型名供 meta 人工核对：本地取 GGUF 文件名，在线 API 取
+    provider/model；提取不到时返回 None（meta 中省略该字段）。"""
+    cfg = _model_config(model)
+    if isinstance(cfg, str):
+        # XB 在线 API 配置是 JSON 字符串
+        try:
+            cfg = json.loads(cfg)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(cfg, dict):
+        name = cfg.get("model")
+        if name:
+            provider = cfg.get("provider")
+            return f"{provider}/{name}" if provider else str(name)
+    return None
+
+
+def _images_paths(kwargs, image_keys):
+    """收集图片 tensor 上挂载的来源路径（由本项目 LoadImageAtFolder 写入）。
+
+    仅作备份记录写入缓存 meta，不参与 key 计算；tensor 没有该属性时跳过。
+    """
+    paths = []
+    for name in image_keys:
+        t = kwargs.get(name)
+        if t is None:
+            continue
+        p = getattr(t, "ryh_source_path", None)
+        if p:
+            paths.append(p)
+    return paths
+
+
 def build_key_parts(kwargs, target):
-    """返回 (完整key, 分量字典)。分量字典写入缓存 meta，便于排查 miss 原因。"""
-    parts = {
-        "image": _images_hash(kwargs, target["image_keys"]),
-        "params": _params_fingerprint(kwargs, target["skip_keys"]),
-        "model": _model_fingerprint(kwargs.get(target["model_key"])),
-    }
-    raw = "|".join((parts["image"], parts["params"], parts["model"]))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest(), parts
+    """返回 (完整key, meta字典)。meta 写入缓存条目，便于人工核对与排查 miss。
+
+    meta 结构（三段均为对象）：
+    - image：{ hash: 内容哈希, paths: [来源文件路径, ...] }（paths 由
+      LoadImageAtFolder 挂载，无则省略该字段）；
+    - params：参与指纹的参数字典原样留档，并含 hash 键（params 指纹哈希）；
+    - model：{ hash: 配置指纹, name: 模型名 }（name 供人工核对，提取不到
+      时省略该字段）。
+    注意：key 的计算方式与此处 meta 无关，仍为 image哈希|params哈希|model哈希。
+    """
+    image_hash = _images_hash(kwargs, target["image_keys"])
+    params_hash, params_raw = _params_fingerprint(kwargs, target["skip_keys"])
+    model = kwargs.get(target["model_key"])
+    model_hash = _model_fingerprint(model)
+    raw = "|".join((image_hash, params_hash, model_hash))
+
+    image_section = {"hash": image_hash}
+    paths = _images_paths(kwargs, target["image_keys"])
+    if paths:
+        image_section["paths"] = paths
+    meta = {"image": image_section}
+    # 保证可 JSON 落盘：与指纹哈希相同的序列化口径做一次 round-trip
+    try:
+        params_section = json.loads(
+            json.dumps(params_raw, sort_keys=True, ensure_ascii=False, default=str)
+        )
+    except (TypeError, ValueError):
+        params_section = {k: str(v) for k, v in params_raw.items()}
+    params_section["hash"] = params_hash
+    meta["params"] = params_section
+    model_section = {"hash": model_hash}
+    name = _model_name(model)
+    if name:
+        model_section["name"] = name
+    meta["model"] = model_section
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest(), meta
 
 
 def build_key(kwargs, target):
@@ -322,23 +394,22 @@ def _find_module_with(*attr_names, require=None):
 
 
 # 各反推节点的 key 计算配置：图片输入名 / 模型输入名 / 不参与指纹的键
-# 注意 seed 不参与 key：缓存的语义是「同图同提示词复用首次结果」，种子随机化
-# 不应让缓存失效（否则每次队列都 miss）。
+#
+# skip_keys 的判定原则：凡是不影响“输出文本”的输入都不进 params 指纹。
+# 它们要么由 key 的另外两段单独表示（图片→内容哈希、模型→配置指纹），
+# 要么是纯副作用/执行元数据（卸载、种子、队列 id 等），变化了也不代表
+# 需要重新反推。
 _QWEN_KEY_CFG = {
     "image_keys": ("图片", "图片2", "图片3", "图片4", "图片5", "图片6", "图片7", "图片8"),
     "model_key": "qwen模型",
     "skip_keys": {
-        "qwen模型",
-        "生成后自动卸载模型",
-        "seed",
-        "图片",
-        "图片2",
-        "图片3",
-        "图片4",
-        "图片5",
-        "图片6",
-        "图片7",
-        "图片8",
+        "qwen模型",  # 模型输入：由 model 段（配置指纹）单独表示；且它是代理/模型
+                     # 对象，不可 JSON 序列化，混进 params 会退化成 repr 哈希
+        "生成后自动卸载模型",  # 纯副作用：跑完是否释放显存，不改变输出文本
+        "seed",  # 随机种子：缓存语义=同图同提示词复用首次结果；ComfyUI 种子控件
+                 # 默认“生成后递增/随机”，若参与 key 则每次队列必 miss
+        "图片", "图片2", "图片3", "图片4",  # 图片输入：由 image 段（内容哈希）单独
+        "图片5", "图片6", "图片7", "图片8",  # 表示，且 tensor 不可 JSON 序列化
     },
 }
 
@@ -346,13 +417,18 @@ _XB_KEY_CFG = {
     "image_keys": ("images",),
     "model_key": "llama_model",
     "skip_keys": {
-        "llama_model",
-        "images",
-        "seed",
-        "force_offload",  # 只是卸载副作用
-        "save_states",  # 参与缓存时恒为 False（见 cached_process）
-        "queue_handler",  # 仅控制执行顺序
-        "unique_id",  # 只影响 state_uid 输出，命中时重新计算
+        "llama_model",  # 模型输入：由 model 段单独表示（本地 config dict 或在线
+                        # API JSON 的哈希）
+        "images",  # 图片输入：由 image 段（逐帧内容哈希）单独表示
+        "seed",  # 同 QwenTE：种子随机化不应让缓存失效
+        "force_offload",  # 纯副作用：推理后是否卸载模型，不改变输出文本
+        "save_states",  # 不参与缓存路径：True 时输出依赖会话历史，cached_process
+                        # 直接放行原逻辑；能进 key 的恒为 False，属常量
+        "queue_handler",  # 执行元数据：仅控制 XB 队列里的执行顺序，与文本无关
+        "unique_id",  # ComfyUI 每次队列分配的运行 id（如 "12.3"），逐次变化；
+                      # 只影响 state_uid 输出，命中时按原规则重算即可
+        # 注：parameters 字典里嵌套的 state_uid 同样不影响文本，由
+        # _params_fingerprint 统一剔除，不在此集合内。
     },
 }
 
@@ -398,7 +474,7 @@ def _install_qwen_patch(mod):
         if "qwen模型" not in kwargs:
             return original_run(self, *args, **kwargs)
         model = kwargs.get("qwen模型")
-        key, parts = build_key_parts(kwargs, _QWEN_KEY_CFG)
+        key, meta = build_key_parts(kwargs, _QWEN_KEY_CFG)
         cached = get(key)
         if cached is not None:
             print(f"{LOG_PREFIX} [QwenTE] 命中缓存，跳过反推（模型未加载）。")
@@ -410,7 +486,7 @@ def _install_qwen_patch(mod):
 
         result = original_run(self, *args, **kwargs)
         if isinstance(result, tuple) and len(result) == 1 and isinstance(result[0], str):
-            put(key, result[0], meta=parts)
+            put(key, result[0], meta=meta)
             print(f"{LOG_PREFIX} [QwenTE] 未命中，已写入缓存。")
         return result
 
@@ -465,7 +541,7 @@ def _install_xb_patch(mod):
         if isinstance(params, dict):
             kwargs["parameters"] = dict(params)
 
-        key, parts = build_key_parts(kwargs, _XB_KEY_CFG)
+        key, meta = build_key_parts(kwargs, _XB_KEY_CFG)
         cached = get(key)
         if cached is not None:
             params = kwargs.get("parameters") or {}
@@ -491,7 +567,7 @@ def _install_xb_patch(mod):
                     "out1": result[0],
                     "out2": list(out2) if isinstance(out2, (list, tuple)) else out2,
                 },
-                meta=parts,
+                meta=meta,
             )
             print(f"{LOG_PREFIX} [XB_llama] 未命中，已写入缓存。")
         return result
