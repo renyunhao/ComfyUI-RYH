@@ -72,26 +72,7 @@ function setupNode(node) {
     node._ryhFolderWidget = folderWidget;
     node._ryhImageWidget = imageWidget;
 
-    // —— 预览区（DOM widget，可伸缩、随节点高度变化）——
-    // 高度交给布局引擎自动分配：不覆盖 computeSize，保留内置 computeLayoutSize，
-    // 布局引擎会把节点“剩余高度”分配给它；--comfy-widget-min-height 保证最小高度。
-    const container = document.createElement("div");
-    container.style.cssText =
-        "width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;background:rgba(0,0,0,0.25);--comfy-widget-min-height:60;";
-    container.hidden = true;
-    const img = document.createElement("img");
-    img.style.cssText = "display:block;max-width:100%;max-height:100%;object-fit:contain;";
-    img.alt = "";
-    container.appendChild(img);
-
-    const previewWidget = node.addDOMWidget("ryh_preview", "preview", container, {
-        serialize: false,
-        hideOnZoom: false,
-    });
-    allowDragFromWidget(previewWidget);
-    node._ryhPreview = { container, img, widget: previewWidget };
-
-    // —— 控制按钮栏：◀ ▶ 计数 [📁 目录] ——
+    // —— 控制按钮栏：◀ ▶ 计数 [📁 目录]（放在预览区上方）——
     const bar = document.createElement("div");
     bar.style.cssText = "display:flex;gap:4px;align-items:center;width:100%;padding:2px 0;";
     const makeBtn = (label, cb) => {
@@ -125,6 +106,25 @@ function setupNode(node) {
         return [width, 28];
     };
     node._ryhCounter = counter;
+
+    // —— 预览区（DOM widget，可伸缩、随节点高度变化）——
+    // 高度交给布局引擎自动分配：不覆盖 computeSize，保留内置 computeLayoutSize，
+    // 布局引擎会把节点“剩余高度”分配给它；--comfy-widget-min-height 保证最小高度。
+    const container = document.createElement("div");
+    container.style.cssText =
+        "width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;background:rgba(0,0,0,0.25);--comfy-widget-min-height:60;";
+    container.hidden = true;
+    const img = document.createElement("img");
+    img.style.cssText = "display:block;max-width:100%;max-height:100%;object-fit:contain;";
+    img.alt = "";
+    container.appendChild(img);
+
+    const previewWidget = node.addDOMWidget("ryh_preview", "preview", container, {
+        serialize: false,
+        hideOnZoom: false,
+    });
+    allowDragFromWidget(previewWidget);
+    node._ryhPreview = { container, img, widget: previewWidget };
 
     // —— 目录变化 → 刷新图片列表 ——
     chainCallback(folderWidget, "callback", function (value) {
