@@ -2,12 +2,15 @@
 
 - LoadImageAtFolder：从任意目录加载一张图片。
 - ExtractMetadata：解析视频/图片容器中的 prompt / workflow metadata。
+- SendNotification：通过 ntfy 发送推送通知。
 """
 
 import json
 import os
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 
 import numpy as np
 import torch
@@ -21,6 +24,19 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".
 
 # 支持的视频扩展名（通过 ffprobe / ffmpeg 读取容器级 metadata tag）
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi", ".flv", ".wmv")
+
+
+class AnyType(str):
+    """通配类型：与任意输入/输出类型兼容（同 XB-BOX / LayerStyle 的做法）。"""
+
+    def __eq__(self, _) -> bool:
+        return True
+
+    def __ne__(self, __value: object) -> bool:
+        return False
+
+
+_any = AnyType("*")
 
 
 def list_images_in_folder(folder):
@@ -284,3 +300,92 @@ class ExtractMetadata:
                 print(f"[ExtractMetadata] 已保存: {p}")
 
         return (prompt_text, workflow_text)
+
+
+class SendNotification:
+    """通过 ntfy 向指定订阅渠道（topic）发送推送通知。
+
+    参考 XB-BOX 显存清理节点：可选的通配输入 + 通配透传输出，
+    可串接在工作流任意位置，执行到该节点时即发送通知。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "message": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "placeholder": "要发送的通知内容",
+                        "tooltip": "通知正文，支持多行文本",
+                    },
+                ),
+                "topic": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "placeholder": "订阅渠道名（topic）",
+                        "tooltip": "ntfy 订阅渠道名，需与手机/桌面端 App 中订阅的 topic 一致；topic 名称是公开的，建议使用不易猜测的名称",
+                    },
+                ),
+            },
+            "optional": {
+                "server": (
+                    "STRING",
+                    {
+                        "default": "https://ntfy.sh",
+                        "multiline": False,
+                        "tooltip": "ntfy 服务器地址，默认使用官方公共服务器；自建服务器可改为自己的地址",
+                    },
+                ),
+                "anything": (
+                    _any,
+                    {"tooltip": "任意输入：把上游节点的输出连到这里，节点即可串接在工作流任意位置触发通知"},
+                ),
+            },
+        }
+
+    OUTPUT_NODE = True
+    RETURN_TYPES = (_any,)
+    RETURN_NAMES = ("pass-through",)
+    FUNCTION = "send"
+    CATEGORY = "utils"
+    DESCRIPTION = "通过 ntfy 发送推送通知到指定订阅渠道（topic）。可选连入任意上游输出，节点会原样透传，可串接在工作流任意位置；执行到该节点时即发送通知。发送失败仅打印日志，不中断工作流。"
+
+    def send(self, message, topic, server="https://ntfy.sh", anything=None):
+        message = (message or "").strip()
+        topic = (topic or "").strip().strip("/")
+        server = (server or "").strip().rstrip("/")
+        if not topic:
+            print("[SendNotification] topic 为空，跳过发送。")
+            return (anything,)
+        if not message:
+            print("[SendNotification] 消息为空，跳过发送。")
+            return (anything,)
+        if not server:
+            server = "https://ntfy.sh"
+
+        url = f"{server}/{topic}"
+        try:
+            req = urllib.request.Request(
+                url,
+                data=message.encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "text/plain; charset=utf-8"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                status = resp.getcode()
+            if 200 <= status < 300:
+                print(f"[SendNotification] 已发送到 {url}")
+            else:
+                print(f"[SendNotification] 发送异常，HTTP 状态码 {status}: {url}")
+        except urllib.error.HTTPError as e:
+            print(f"[SendNotification] 发送失败，HTTP {e.code} {e.reason}: {url}")
+        except urllib.error.URLError as e:
+            print(f"[SendNotification] 发送失败，网络错误 {e.reason}: {url}")
+        except Exception as e:
+            print(f"[SendNotification] 发送失败: {e}")
+        return (anything,)

@@ -3,6 +3,7 @@
 当前节点：
 - LoadImageAtFolder：从任意目录加载一张图片（目录选择 / ◀ ▶ 切换 / 节点内等比预览）。
 - ExtractMetadata：解析视频/图片中的 metadata，输出 prompt 与 workflow。
+- SendNotification：通过 ntfy 发送推送通知。
 """
 
 import os
@@ -10,17 +11,19 @@ import os
 from aiohttp import web
 from server import PromptServer
 
-from .nodes import ExtractMetadata, LoadImageAtFolder, list_images_in_folder, resolve_image_path
+from .nodes import ExtractMetadata, LoadImageAtFolder, SendNotification, list_images_in_folder, resolve_image_path
 from . import caption_cache
 
 NODE_CLASS_MAPPINGS = {
     "LoadImageAtFolder": LoadImageAtFolder,
     "ExtractMetadata": ExtractMetadata,
+    "SendNotification": SendNotification,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadImageAtFolder": "Load Image At Folder (RYH)",
     "ExtractMetadata": "Extract Metadata (RYH)",
+    "SendNotification": "Send Notification (RYH)",
 }
 
 WEB_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js")
