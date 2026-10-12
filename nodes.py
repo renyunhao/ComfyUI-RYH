@@ -19,11 +19,7 @@ from PIL import Image, ImageOps, ImageSequence
 import folder_paths
 import node_helpers
 
-# 支持的图片扩展名（与官方 LoadImage 保持一致的常见格式）
-IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".avif")
-
-# 支持的视频扩展名（通过 ffprobe / ffmpeg 读取容器级 metadata tag）
-VIDEO_EXTENSIONS = (".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi", ".flv", ".wmv")
+from .media_core import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, resolve_media_path
 
 
 class AnyType(str):
@@ -37,47 +33,6 @@ class AnyType(str):
 
 
 _any = AnyType("*")
-
-
-def list_images_in_folder(folder):
-    """返回目录下按文件名排序的图片列表（仅文件名）。目录无效时返回空列表。"""
-    if not folder or not os.path.isdir(folder):
-        return []
-    try:
-        names = []
-        for name in os.listdir(folder):
-            full_path = os.path.join(folder, name)
-            if os.path.isfile(full_path) and os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
-                names.append(name)
-    except OSError:
-        return []
-    return sorted(names, key=str.lower)
-
-
-def resolve_image_path(folder, image):
-    """把 image 输入值解析为绝对路径。
-
-    兼容三种取值：
-    1. 绝对路径 -> 原样使用；
-    2. 裸文件名 -> 与 folder 拼接（节点自身下拉列表的行为）；
-    3. 含目录分隔符的路径 -> 先尝试相对 folder，不存在再按相对
-       ComfyUI input 根目录解析（批量工具下拉注入的是这种路径）。
-    """
-    if not image:
-        return ""
-    if os.path.isabs(image):
-        return os.path.normpath(image)
-    if "/" in image or os.path.sep in image:
-        folder_candidate = os.path.normpath(os.path.join(folder, image))
-        if os.path.isfile(folder_candidate):
-            return folder_candidate
-        input_candidate = os.path.normpath(
-            os.path.join(folder_paths.get_input_directory(), image)
-        )
-        if os.path.isfile(input_candidate):
-            return input_candidate
-        return folder_candidate
-    return os.path.normpath(os.path.join(folder, image))
 
 
 class LoadImageAtFolder:
@@ -108,7 +63,7 @@ class LoadImageAtFolder:
     RETURN_NAMES = ("image", "mask", "image_path", "folder_name", "file_name")
     FUNCTION = "load_image"
     CATEGORY = "image/loaders"
-    DESCRIPTION = "从任意目录加载一张图片，支持目录选择、◀ ▶ 快速切换与节点内预览；选择 none 时输出空张量。额外输出图片完整路径、文件名与所选目录的最后一级文件夹名。"
+    DESCRIPTION = "从任意目录加载一张图片，支持目录选择、◀ ▶ 快速切换、缩略图画廊选图与节点内大图预览；选择 none 时输出空张量。额外输出图片完整路径、文件名与所选目录的最后一级文件夹名。"
 
     @classmethod
     def VALIDATE_INPUTS(cls, **kwargs):
@@ -128,7 +83,7 @@ class LoadImageAtFolder:
 
         # folder_name 从解析后的图片路径取，兼容 image 被 xyz 等外部插件
         # 直接覆盖为完整路径（此时 folder 输入并未同步变化）的情况
-        image_path = resolve_image_path(folder, image)
+        image_path = resolve_media_path(folder, image)
         folder_name = os.path.basename(os.path.dirname(image_path)) if image_path else ""
         file_name = os.path.splitext(os.path.basename(image))[0]
         if not os.path.isfile(image_path):

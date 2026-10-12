@@ -1,9 +1,16 @@
 """ComfyUI-RYH · 自定义节点包。
 
 当前节点：
-- LoadImageAtFolder：从任意目录加载一张图片（目录选择 / ◀ ▶ 切换 / 节点内等比预览）。
+- LoadImageAtFolder：从任意目录加载一张图片（目录选择 / ◀ ▶ 切换 / 缩略图画廊 / 节点内等比预览）。
+- LoadVideoAtFolder：从任意目录加载视频，输出帧序列 + 音轨 + 帧率 + 官方 VIDEO。
+- LoadAudioAtFolder：从任意目录加载音频，输出官方 AUDIO 结构，支持秒级裁剪。
 - ExtractMetadata：解析视频/图片中的 metadata，输出 prompt 与 workflow。
 - SendNotification：通过 ntfy 发送推送通知。
+- H3DirectorPromptSpy：抓取官方 MiniMax H3 条件节点实际收到的最终 prompt。
+- H3DirectorSegment / H3DirectorSegmentList：把导演台合并后的每段提示词、裁剪画面与参考图读到图上。
+- H3DirectorSegmentPromptOverride / H3DirectorSegmentListPromptOverride：改完通过导演台新增的
+  h3_bus 输入口回写，一次 Queue 即生效。
+- H3DirectorBusDoctor：自检补丁状态、快照内容与本次回写记录。
 """
 
 import os
@@ -11,19 +18,45 @@ import os
 from aiohttp import web
 from server import PromptServer
 
-from .nodes import ExtractMetadata, LoadImageAtFolder, SendNotification, list_images_in_folder, resolve_image_path
+from . import media_core
+from .media_nodes import LoadAudioAtFolder, LoadVideoAtFolder
+from .nodes import ExtractMetadata, LoadImageAtFolder, SendNotification
 from . import caption_cache
+from .h3_prompt_spy import H3DirectorPromptSpy
+from .h3_segment_bus import (
+    H3DirectorBusDoctor,
+    H3DirectorSegment,
+    H3DirectorSegmentList,
+    H3DirectorSegmentListPromptOverride,
+    H3DirectorSegmentPromptOverride,
+)
 
 NODE_CLASS_MAPPINGS = {
     "LoadImageAtFolder": LoadImageAtFolder,
+    "LoadVideoAtFolder": LoadVideoAtFolder,
+    "LoadAudioAtFolder": LoadAudioAtFolder,
     "ExtractMetadata": ExtractMetadata,
     "SendNotification": SendNotification,
+    "H3DirectorPromptSpy": H3DirectorPromptSpy,
+    "H3DirectorSegment": H3DirectorSegment,
+    "H3DirectorSegmentList": H3DirectorSegmentList,
+    "H3DirectorSegmentPromptOverride": H3DirectorSegmentPromptOverride,
+    "H3DirectorSegmentListPromptOverride": H3DirectorSegmentListPromptOverride,
+    "H3DirectorBusDoctor": H3DirectorBusDoctor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadImageAtFolder": "Load Image At Folder (RYH)",
+    "LoadVideoAtFolder": "Load Video At Folder (RYH)",
+    "LoadAudioAtFolder": "Load Audio At Folder (RYH)",
     "ExtractMetadata": "Extract Metadata (RYH)",
     "SendNotification": "Send Notification (RYH)",
+    "H3DirectorPromptSpy": "H3Director Prompt Spy (RYH)",
+    "H3DirectorSegment": "H3Director Segment (RYH)",
+    "H3DirectorSegmentList": "H3Director Segment List (RYH)",
+    "H3DirectorSegmentPromptOverride": "H3Director Segment Prompt Override (RYH)",
+    "H3DirectorSegmentListPromptOverride": "H3Director Segment List Prompt Override (RYH)",
+    "H3DirectorBusDoctor": "H3Director Bus Doctor (RYH)",
 }
 
 WEB_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js")
@@ -38,15 +71,20 @@ except ImportError:
     pass
 
 
-@PromptServer.instance.routes.post("/ryh/list_images")
-async def ryh_list_images(request):
-    """根据目录路径返回该目录下的图片文件名列表（前端刷新下拉选项用）。"""
+@PromptServer.instance.routes.post("/ryh/list_media")
+async def ryh_list_media(request):
+    """按目录 + 类型（image/video/audio）返回文件列表，带 mtime 与时长/帧数等标注信息。
+
+    mtime 会随缩略图/播放 URL 一起回传，前端用它做缓存位，比每次塞 t=Date.now()
+    少一堆穿透请求，文件被替换后也能正确失效。
+    """
     try:
         data = await request.json()
     except Exception:
         data = {}
     folder = data.get("folder", "")
-    return web.json_response({"images": list_images_in_folder(folder)})
+    kind = data.get("kind", "image")
+    return web.json_response({"files": media_core.list_media(folder, kind)})
 
 
 @PromptServer.instance.routes.post("/ryh/choose_folder")
@@ -91,20 +129,22 @@ async def ryh_choose_file(request):
         return web.json_response({"path": "", "error": f"文件选择失败: {e}"})
 
 
-@PromptServer.instance.routes.post("/ryh/delete_image")
-async def ryh_delete_image(request):
-    """删除目录下的指定图片文件（LoadImageAtFolder 节点前端删除按钮调用）。"""
+@PromptServer.instance.routes.post("/ryh/delete_file")
+async def ryh_delete_file(request):
+    """删除目录下的指定媒体文件（三个节点前端的 🗑 按钮共用）。"""
     try:
         data = await request.json()
     except Exception:
         data = {}
     folder = data.get("folder", "")
-    image = data.get("image", "")
-    if not image or image == "none":
-        return web.json_response({"ok": False, "error": "未选择图片，无法删除。"})
-    path = resolve_image_path(folder, image)
+    name = data.get("file", "")
+    if not name or name == "none":
+        return web.json_response({"ok": False, "error": "未选择文件，无法删除。"})
+    path = media_core.resolve_media_path(folder, name)
     if not path or not os.path.isfile(path):
         return web.json_response({"ok": False, "error": f"文件不存在: {path}"})
+    if not media_core.is_allowed_media(path):
+        return web.json_response({"ok": False, "error": f"不是可删除的媒体文件: {path}"})
     try:
         os.remove(path)
     except OSError as e:
@@ -112,15 +152,47 @@ async def ryh_delete_image(request):
     return web.json_response({"ok": True, "path": path})
 
 
-@PromptServer.instance.routes.get("/ryh/image")
-async def ryh_image(request):
-    """返回目录下指定图片的原始字节，供前端节点内预览。"""
+@PromptServer.instance.routes.get("/ryh/media")
+async def ryh_media(request):
+    """返回目录下指定媒体的原始字节，供前端 <img>/<video>/<audio> 预览。
+
+    FileResponse 支持 Range 请求（206），浏览器标签才能拖动进度条播放；
+    folder 是用户任意指定的路径，所以必须先用扩展名白名单挡住非媒体文件。
+    """
     folder = request.query.get("folder", "")
-    image = request.query.get("image", "")
-    path = resolve_image_path(folder, image)
-    if not path or not os.path.isfile(path):
+    name = request.query.get("file", "")
+    path = media_core.resolve_media_path(folder, name)
+    if not path or not os.path.isfile(path) or not media_core.is_allowed_media(path):
         return web.Response(status=404, text="file not found")
     return web.FileResponse(path)
+
+
+@PromptServer.instance.routes.get("/ryh/thumbnail")
+async def ryh_thumbnail(request):
+    """返回目录下指定媒体的正方形缩略图（图片裁切 / 视频取帧 / 音频波形）。
+
+    响应带 ETag 且支持 If-None-Match 命中 304：画廊一次可能请求上百张，
+    不能让浏览器每次都重新下载，也不能靠前端拼时间戳做缓存失效（那会全量穿透）。
+    """
+    folder = request.query.get("folder", "")
+    name = request.query.get("file", "")
+    try:
+        size = int(request.query.get("size", "128"))
+    except ValueError:
+        size = 128
+    size = min(512, max(16, size))
+
+    path = media_core.resolve_media_path(folder, name)
+    if not path or not os.path.isfile(path) or not media_core.is_allowed_media(path):
+        return web.Response(status=404, text="file not found")
+    data, etag = media_core.build_thumbnail(path, size)
+    if data is None:
+        return web.Response(status=404, text="not a media file")
+
+    headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+    if etag in (request.headers.get("If-None-Match") or "").split(","):
+        return web.Response(status=304, headers=headers)
+    return web.Response(body=data, content_type="image/webp", headers=headers)
 
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
