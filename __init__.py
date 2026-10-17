@@ -6,11 +6,16 @@
 - LoadAudioAtFolder：从任意目录加载音频，输出官方 AUDIO 结构，支持秒级裁剪。
 - ExtractMetadata：解析视频/图片中的 metadata，输出 prompt 与 workflow。
 - SendNotification：通过 ntfy 发送推送通知。
+- CaptionCachePolicy：反推缓存开关，接到 comfyui-llama-TE / XB_ToolBox 反推节点
+  被注入的「缓存控制」口上；不接线即不缓存。
 - H3DirectorPromptSpy：抓取官方 MiniMax H3 条件节点实际收到的最终 prompt。
 - H3DirectorSegment / H3DirectorSegmentList：把导演台合并后的每段提示词、裁剪画面与参考图读到图上。
 - H3DirectorSegmentPromptOverride / H3DirectorSegmentListPromptOverride：改完通过导演台新增的
   h3_bus 输入口回写，一次 Queue 即生效。
 - H3DirectorBusDoctor：自检补丁状态、快照内容与本次回写记录。
+
+第三方节点补丁（不改对方源文件，默认保持原版行为）：
+- Video Combine 🎥🅥🅗🅢：注入 only_save_with_audio 开关，打开后只保留带音频那份视频。
 """
 
 import os
@@ -22,6 +27,8 @@ from . import media_core
 from .media_nodes import LoadAudioAtFolder, LoadVideoAtFolder
 from .nodes import ExtractMetadata, LoadImageAtFolder, SendNotification
 from . import caption_cache
+from .caption_cache import CaptionCachePolicy
+from . import vhs_save_policy
 from .h3_prompt_spy import H3DirectorPromptSpy
 from .h3_segment_bus import (
     H3DirectorBusDoctor,
@@ -37,6 +44,7 @@ NODE_CLASS_MAPPINGS = {
     "LoadAudioAtFolder": LoadAudioAtFolder,
     "ExtractMetadata": ExtractMetadata,
     "SendNotification": SendNotification,
+    "CaptionCachePolicy": CaptionCachePolicy,
     "H3DirectorPromptSpy": H3DirectorPromptSpy,
     "H3DirectorSegment": H3DirectorSegment,
     "H3DirectorSegmentList": H3DirectorSegmentList,
@@ -51,6 +59,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadAudioAtFolder": "Load Audio At Folder (RYH)",
     "ExtractMetadata": "Extract Metadata (RYH)",
     "SendNotification": "Send Notification (RYH)",
+    "CaptionCachePolicy": "Caption Cache Policy (RYH)",
     "H3DirectorPromptSpy": "H3Director Prompt Spy (RYH)",
     "H3DirectorSegment": "H3Director Segment (RYH)",
     "H3DirectorSegmentList": "H3Director Segment List (RYH)",
@@ -223,4 +232,24 @@ async def _on_startup_apply_cache(_app):
         print(f"[ComfyUI-RYH] 反推缓存 patch 安装失败，已跳过（不影响正常使用）: {e}")
 
 
+async def _on_startup_apply_vhs(_app):
+    try:
+        vhs_save_policy.apply_patch()
+    except Exception as e:
+        print(f"[ComfyUI-RYH] Video Combine 开关 patch 安装失败，已跳过（不影响正常使用）: {e}")
+
+
+def _install_vhs_save_policy():
+    """给 VHS 的 Video Combine 注入开关，同样要等第三方节点加载完。"""
+    try:
+        PromptServer.instance.app.on_startup.append(_on_startup_apply_vhs)
+    except Exception as e:
+        print(f"[ComfyUI-RYH] on_startup 注册失败，直接尝试安装 VHS 开关: {e}")
+        try:
+            vhs_save_policy.apply_patch()
+        except Exception as e2:
+            print(f"[ComfyUI-RYH] VHS 开关 patch 安装失败，已跳过（不影响正常使用）: {e2}")
+
+
 _install_caption_cache()
+_install_vhs_save_policy()

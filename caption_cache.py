@@ -7,6 +7,9 @@
 
 工作方式：
 
+- **默认不缓存**。反推节点被注入了一个 `RYH_CACHE_POLICY` 输入口，只有接上
+  `Caption Cache Policy (RYH)` 节点、且策略为「缓存」或「强制重推」时才会读/写缓存；
+  不接线时行为与原版完全一致（每次真的反推）。
 - 命中缓存：直接返回上次反推得到的文本，**完全不调用模型**（配合懒加载，
   连 GGUF 都不会被加载进显存）。
 - 未命中：正常执行原反推逻辑，并把结果写入磁盘缓存。
@@ -17,10 +20,12 @@
 
 缓存 key = 图片内容哈希 + 影响输出文本的全部参数 + 模型配置指纹。
 内容哈希保证「同内容不同路径」也能命中，「同路径换了图」不会误命中，
-因此比单纯按文件路径查更可靠，这里不再依赖路径。
+因此比单纯按文件路径查更可靠，这里不再依赖路径。策略口在算 key 前就被摘掉，
+不参与指纹。
 """
 
 import hashlib
+import inspect
 import json
 import os
 import threading
@@ -375,6 +380,93 @@ class _LazyQwenModel:
 
 
 # ---------------------------------------------------------------------------
+# 缓存策略：opt-in 开关，靠注入到第三方节点上的输入口传进来
+# ---------------------------------------------------------------------------
+
+CACHE_POLICY_TYPE = "RYH_CACHE_POLICY"
+POLICY_OFF = "off"
+POLICY_CACHE = "cache"
+POLICY_REFRESH = "refresh"
+
+_MODES = {
+    "不缓存": POLICY_OFF,
+    "缓存（读+写）": POLICY_CACHE,
+    "强制重推（覆盖缓存）": POLICY_REFRESH,
+}
+
+
+def _pop_policy(kwargs, policy_key):
+    """取出并摘掉策略口，返回策略 token；未接线返回 POLICY_OFF（默认不缓存）。
+
+    必须在算 key 之前调用：策略值不是反推输入，既不能进 params 指纹（否则一拨
+    开关全 miss），也不能原样传给对方的 run/process——两者都是显式参数列表，
+    多一个 kwarg 就 TypeError。
+    """
+    raw = kwargs.pop(policy_key, None)
+    return raw if raw in (POLICY_CACHE, POLICY_REFRESH) else POLICY_OFF
+
+
+# patch 第三方 INPUT_TYPES 时用的标记，避免重复注入同一个口
+_IT_MARKER = "_ryh_caption_cache_policy_input"
+
+
+def _inject_policy_input(cls, policy_key, tooltip):
+    """往节点 INPUT_TYPES 的 optional 里加一个策略口（不改对方源文件）。
+
+    optional 且未连线的自定义类型口不会出现在 kwargs 里，正好用来表达「没接=默认」。
+    """
+    if getattr(cls.INPUT_TYPES, _IT_MARKER, False):
+        return
+    raw = inspect.getattr_static(cls, "INPUT_TYPES")
+    it_func = getattr(raw, "__func__", raw)
+    if not callable(it_func):
+        raise TypeError(f"{cls.__name__}.INPUT_TYPES 不可调用，跳过注入口")
+
+    def input_types(klass):
+        spec = it_func(klass)
+        spec.setdefault("optional", {})[policy_key] = (CACHE_POLICY_TYPE, {"tooltip": tooltip})
+        return spec
+
+    setattr(input_types, _IT_MARKER, True)
+    cls.INPUT_TYPES = classmethod(input_types)
+
+
+class CaptionCachePolicy:
+    """反推缓存开关：输出接到已打补丁节点新增的「缓存控制」口上才生效。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mode": (list(_MODES), {"default": "缓存（读+写）", "tooltip":
+                    "不缓存=每次真的反推，不读也不写；\n"
+                    "缓存（读+写）=命中直接返回、未命中反推后写入；\n"
+                    "强制重推（覆盖缓存）=跳过读取、真的重新反推并覆盖旧条目，"
+                    "并且每次 Queue 都会重跑（不被 ComfyUI 的执行缓存挡住）。"}),
+            }
+        }
+
+    RETURN_TYPES = (CACHE_POLICY_TYPE,)
+    RETURN_NAMES = ("cache_policy",)
+    FUNCTION = "make"
+    CATEGORY = "utils"
+    _force = 0
+
+    @classmethod
+    def IS_CHANGED(cls, mode=None, **kwargs):
+        # 「强制重推」必须让这个节点的输出每次都不一样，ComfyUI 才会把下游反推节点
+        # 从自己的执行缓存里拉出来重跑；否则上游 widget 没变时反推节点根本不会被执行，
+        # 我们的 patch 也就没机会跳过读取。
+        if _MODES.get(mode) == POLICY_REFRESH:
+            cls._force += 1
+            return f"ryh-cache-force-{cls._force}"
+        return False
+
+    def make(self, mode):
+        return (_MODES.get(mode, POLICY_OFF),)
+
+
+# ---------------------------------------------------------------------------
 # monkey-patch 安装
 # ---------------------------------------------------------------------------
 
@@ -388,7 +480,6 @@ def _find_module_with(*attr_names, require=None):
     惰性返回 _OpNamespace。这里要求每个属性必须是真正的类，并额外校验
     require 中的 (类名, 方法名, 是否 classmethod) 形态。
     """
-    import inspect
     import sys
 
     for name, mod in list(sys.modules.items()):
@@ -466,6 +557,12 @@ _XB_KEY_CFG = {
 }
 
 
+# 策略口在各目标节点上的输入名（跟随各自的 UI 语言）
+_QWEN_POLICY_KEY = "缓存控制"
+_XB_POLICY_KEY = "cache_policy"
+_POLICY_TOOLTIP = "接 Caption Cache Policy (RYH)：决定本节点是否读写反推缓存。不接=不缓存。"
+
+
 # ---------------------------------------------------------------------------
 # 目标 1：comfyui-llama-TE（QwenTE图像推理）
 # ---------------------------------------------------------------------------
@@ -473,6 +570,11 @@ _XB_KEY_CFG = {
 def _install_qwen_patch(mod):
     storage = mod._QwenStorage
     infer_cls = mod.QwenTE图像推理
+    # 输入口注入单独 try：一处失败只影响开关，不该连累已经能工作的缓存逻辑。
+    try:
+        _inject_policy_input(infer_cls, _QWEN_POLICY_KEY, _POLICY_TOOLTIP)
+    except Exception as e:
+        print(f"{LOG_PREFIX} [QwenTE] 缓存控制输入口注入失败: {e}", flush=True)
     if getattr(infer_cls, _PATCHED_FLAG, False):
         return True
 
@@ -525,21 +627,31 @@ def _install_qwen_patch(mod):
         # ComfyUI 以关键字参数调用 FUNCTION，正常 kwargs 已含全部输入
         if "qwen模型" not in kwargs:
             return original_run(self, *args, **kwargs)
+        # 先摘掉策略口：既不让它进 key，也不让它进原函数（run 是显式参数列表）
+        policy = _pop_policy(kwargs, _QWEN_POLICY_KEY)
         model = kwargs.get("qwen模型")
-        key, meta = build_key_parts(kwargs, _QWEN_KEY_CFG)
-        cached = get(key)
-        if cached is not None:
-            print(f"{LOG_PREFIX} [QwenTE] 命中缓存，跳过反推（模型未加载）。", flush=True)
-            return (cached,)
 
-        # 未命中：把懒代理解析成真实模型，避免原 run 内部触发二次加载
+        if policy == POLICY_OFF:
+            if isinstance(model, _LazyQwenModel):
+                kwargs["qwen模型"] = model.resolve()
+            return original_run(self, *args, **kwargs)
+
+        key, meta = build_key_parts(kwargs, _QWEN_KEY_CFG)
+        if policy == POLICY_CACHE:
+            cached = get(key)
+            if cached is not None:
+                print(f"{LOG_PREFIX} [QwenTE] 命中缓存，跳过反推（模型未加载）。", flush=True)
+                return (cached,)
+
+        # 走到这里就是要真反推：把懒代理解析成真实模型，避免原 run 内部触发二次加载
         if isinstance(model, _LazyQwenModel):
             kwargs["qwen模型"] = model.resolve()
 
         result = original_run(self, *args, **kwargs)
         if isinstance(result, tuple) and len(result) == 1 and isinstance(result[0], str):
             put(key, result[0], meta=meta)
-            print(f"{LOG_PREFIX} [QwenTE] 未命中，已写入缓存。", flush=True)
+            label = "未命中" if policy == POLICY_CACHE else "强制重推"
+            print(f"{LOG_PREFIX} [QwenTE] {label}，已写入缓存。", flush=True)
         return result
 
     infer_cls.run = cached_run
@@ -556,6 +668,10 @@ def _install_xb_patch(mod):
     storage = mod.LLAMA_CPP_STORAGE
     infer_cls = mod.XB_llamaInstruct
     loader_cls = mod.XB_llamaModelLoader
+    try:
+        _inject_policy_input(infer_cls, _XB_POLICY_KEY, _POLICY_TOOLTIP)
+    except Exception as e:
+        print(f"{LOG_PREFIX} [XB_llama] 缓存控制输入口注入失败: {e}", flush=True)
     if getattr(infer_cls, _PATCHED_FLAG, False):
         return True
 
@@ -582,34 +698,43 @@ def _install_xb_patch(mod):
             has_images = images is not None and int(images.shape[0]) > 0
         except Exception:
             has_images = False
-        if not has_images or kwargs.get("save_states"):
-            return original_process(self, *args, **kwargs)
+        # 先摘掉策略口：既不让它进 key，也不让它进原函数（process 是显式参数列表）
+        policy = _pop_policy(kwargs, _XB_POLICY_KEY)
 
         # 关键：原 process 会对 parameters 字典做 pop（present_penalty / state_uid），
         # 而该字典是上游 XB_llamaParameters 节点的输出对象、跨次执行复用。若放任
-        # 其被变异，下次执行算出的 params 指纹就少了键，导致同图同参也 miss。
-        # 这里传副本进去，保护共享字典不被污染。
+        # 其被变异，下次执行算出的 params 指纹就少了键，导致同图同参也 miss；
+        # 而这里无论走哪条路径都可能被复用，所以副本保护对所有委派路径都要做。
         params = kwargs.get("parameters")
         if isinstance(params, dict):
             kwargs["parameters"] = dict(params)
 
-        key, meta = build_key_parts(kwargs, _XB_KEY_CFG)
-        cached = get(key)
-        if cached is not None:
-            params = kwargs.get("parameters") or {}
-            uid = params.get("state_uid", None)
-            if uid in (None, -1):
-                uid = str(kwargs.get("unique_id", "0")).rpartition(".")[-1]
-            print(f"{LOG_PREFIX} [XB_llama] 命中缓存，跳过反推（模型未加载）。", flush=True)
-            return (cached.get("out1", ""), cached.get("out2", []), uid)
-
-        # 未命中：懒加载模式下确保模型就绪。llama_model 为 dict/list 时是本地
-        # 配置；为字符串时是在线 API 配置，无需加载。
-        model = kwargs.get("llama_model")
-        if isinstance(model, (dict, list)):
-            if storage.llm is None or storage.current_config != model:
+        def ensure_model():
+            # 加载器已被改成懒加载（只回 config dict），所以任何真的要推理的路径
+            # 都得先把模型准备好。llama_model 为 dict/list 时是本地配置；
+            # 为字符串时是在线 API 配置，无需加载。
+            model = kwargs.get("llama_model")
+            if isinstance(model, (dict, list)) and (
+                storage.llm is None or storage.current_config != model
+            ):
                 storage.load_model(model)
 
+        if not has_images or kwargs.get("save_states") or policy == POLICY_OFF:
+            ensure_model()
+            return original_process(self, *args, **kwargs)
+
+        key, meta = build_key_parts(kwargs, _XB_KEY_CFG)
+        if policy == POLICY_CACHE:
+            cached = get(key)
+            if cached is not None:
+                params = kwargs.get("parameters") or {}
+                uid = params.get("state_uid", None)
+                if uid in (None, -1):
+                    uid = str(kwargs.get("unique_id", "0")).rpartition(".")[-1]
+                print(f"{LOG_PREFIX} [XB_llama] 命中缓存，跳过反推（模型未加载）。", flush=True)
+                return (cached.get("out1", ""), cached.get("out2", []), uid)
+
+        ensure_model()
         result = original_process(self, *args, **kwargs)
         if isinstance(result, tuple) and len(result) >= 2 and isinstance(result[0], str):
             out2 = result[1]
@@ -621,7 +746,8 @@ def _install_xb_patch(mod):
                 },
                 meta=meta,
             )
-            print(f"{LOG_PREFIX} [XB_llama] 未命中，已写入缓存。", flush=True)
+            label = "未命中" if policy == POLICY_CACHE else "强制重推"
+            print(f"{LOG_PREFIX} [XB_llama] {label}，已写入缓存。", flush=True)
         return result
 
     infer_cls.process = cached_process
