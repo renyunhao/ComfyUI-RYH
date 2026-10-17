@@ -16,6 +16,11 @@
 
 第三方节点补丁（不改对方源文件，默认保持原版行为）：
 - Video Combine 🎥🅥🅗🅢：注入 only_save_with_audio 开关，打开后只保留带音频那份视频。
+- comfyui-llama-TE / XB_ToolBox 反推节点：注入「缓存控制」口 + 懒加载（见 caption_cache）。
+- MiniMaxH3 导演台：注入 h3_bus 回传口 + plan 快照（见 h3_segment_bus）。
+
+排查崩溃时可以用环境变量 `RYH_DISABLE_PATCHES=1` 一次性关掉上面三类补丁，
+让第三方节点回到原版行为做 A/B 对比（改了要重启 ComfyUI 才生效）。
 """
 
 import os

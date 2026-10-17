@@ -14,6 +14,11 @@
 
 import os
 
+try:
+    from .ryh_director import DISABLE_ENV, patches_disabled
+except ImportError:  # 直接按目录导入（离线测试用）
+    from ryh_director import DISABLE_ENV, patches_disabled
+
 LOG_PREFIX = "[RYH VideoCombine]"
 
 _WIDGET_NAME = "only_save_with_audio"
@@ -68,29 +73,39 @@ def _audio_path(files):
     return audio, silent
 
 
-def _drop_silent(result):
-    removed = None
+def _output_files(result):
+    """取 VHS 的产物列表。
+
+    返回形态是 {"result": ((save_output, [路径, ...]),)}——注意是双层元组，
+    列表在 [0][1] 而不是 [1]。
+    """
     try:
-        files = result["result"][1]
+        files = result["result"][0][1]
     except (KeyError, IndexError, TypeError):
         return None
-    if not isinstance(files, list):
-        return None
-    found = _audio_path(files)
+    return files if isinstance(files, list) else None
+
+
+def _drop_silent(result):
+    """删掉无声副本并把输出列表收敛到带音频那份；返回被删路径或 None。"""
+    files = _output_files(result)
+    found = _audio_path(files) if files else None
     if found is None:
         return None
     _, silent = found
     if os.path.isfile(silent):
         try:
             os.remove(silent)
-            removed = silent
         except OSError as e:
             print(f"{LOG_PREFIX} 无法删除无声副本: {e}", flush=True)
+            return None
+    else:
+        silent = None
     files.pop(-2)
     preview = (result.get("ui") or {}).get("gifs")
-    if preview and preview[0].get("fullpath") == silent:
+    if preview and preview[0].get("fullpath") not in (None, files[-1]):
         preview[0]["fullpath"] = files[-1]
-    return removed
+    return silent
 
 
 def _install(cls):
@@ -102,6 +117,9 @@ def _install(cls):
 
     def combine_video(self, *args, **kwargs):
         keep_audio_only = kwargs.pop(_WIDGET_NAME, False)
+        # 开关打开却什么都没清：接了 audio 说明是补丁失效（对方改了输出形态），
+        # 没接 audio 则本来就只有份无声视频，属正常，不该刷屏
+        had_audio = kwargs.get("audio") is not None
         result = original_combine(self, *args, **kwargs)
         # 兼容 ComfyUI 前端把 BOOLEAN 传成字符串 "true"/"false"
         if isinstance(keep_audio_only, str):
@@ -111,6 +129,8 @@ def _install(cls):
         removed = _drop_silent(result)
         if removed:
             print(f"{LOG_PREFIX} 已删除无声副本：{os.path.basename(removed)}", flush=True)
+        elif had_audio:
+            print(f"{LOG_PREFIX} 开关已打开但未找到无声副本，输出形态可能变了。", flush=True)
         return result
 
     cls.combine_video = combine_video
@@ -129,6 +149,10 @@ def apply_patch():
     """
     import inspect
     import sys
+
+    if patches_disabled():
+        print(f"{LOG_PREFIX} {DISABLE_ENV} 已设置，跳过 patch（Video Combine 保持原版行为）。", flush=True)
+        return False
 
     cls = None
     for name in list(sys.modules):

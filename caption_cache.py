@@ -29,8 +29,11 @@ import inspect
 import json
 import os
 import threading
+import weakref
 
 import folder_paths
+
+from .ryh_director import DISABLE_ENV, patches_disabled
 
 LOG_PREFIX = "[RYH CaptionCache]"
 
@@ -310,6 +313,11 @@ def build_key(kwargs, target):
 # + 类方法/dunder），其余一律抛 AttributeError，使探测安全地返回默认值。
 # 一旦代理已解析（模型已真实加载），则无条件委托，行为与原版一致。
 
+# 所有还活着的代理（弱引用，不影响代理本身的回收）。卸载时用来找出“仍引用着刚被
+# close 的那个模型”的代理并放开引用。
+_PROXIES = weakref.WeakSet()
+
+
 class _LazyQwenModel:
     """包装 comfyui-llama-TE 的模型对象，延迟到真正需要时才加载 GGUF。
 
@@ -335,6 +343,18 @@ class _LazyQwenModel:
         # 合法消费者（多轮对话等）拿不到模型。
         allowed = set(getattr(real_cls, "__annotations__", ()))
         self.__dict__["_ryh_allowed"] = allowed or {"llm", "settings", "chat_handler"}
+        _PROXIES.add(self)
+
+    def release(self) -> None:
+        """丢掉本代理持有的真实模型引用（模型已被卸载时调用）。
+
+        代理本身会被 ComfyUI 的节点输出缓存跨 Queue 留住，所以只要代理还引用着
+        真实模型，`卸载显存模型` 就什么都释放不了（日志表现是 freed 0.00+0.00GB），
+        显存只能等某次任意线程上的循环 GC 才归还；而 resolve 又可能把这种已 close
+        的 ggml 上下文当成“配置一致，复用”交回去，等于在已释放的显存上推理。
+        """
+        self.__dict__["_ryh_real"] = None
+        self.__dict__["_ryh_prev"] = None
 
     def resolve(self):
         """真正加载并返回底层模型对象（幂等，且与 _QwenStorage.model 保持同步）。"""
@@ -360,8 +380,12 @@ class _LazyQwenModel:
         else:
             prev = cur
         cls.model = prev
-        self.__dict__["_ryh_real"] = self.__dict__["_ryh_real_loader"](cfg)
-        return self.__dict__["_ryh_real"]
+        real = self.__dict__["_ryh_real_loader"](cfg)
+        self.__dict__["_ryh_real"] = real
+        # prev 已经交棒给 cls.model（原 load 要么复用它、要么先 unload 掉），
+        # 代理不再额外持有，否则卸载后旧模型仍被引用。
+        self.__dict__["_ryh_prev"] = None
+        return real
 
     def __getattr__(self, name):
         # _ryh_* 都在 __dict__ 中，不会走到这里。
@@ -616,7 +640,15 @@ def _install_qwen_patch(mod):
         cur = cls.model
         if isinstance(cur, _LazyQwenModel):
             cls.model = cur._ryh_real if cur._ryh_real is not None else cur._ryh_prev
+        victim = cls.model
         original_storage_unload(cls)
+        # 原 unload 会 close 掉 victim 的 ggml 上下文并把 cls.model 置 None，但代理
+        # （以及 ComfyUI 的输出缓存）还可能引用着它。这里统一放开引用：显存立刻归还，
+        # 也不会有代理把已 close 的上下文当成“配置一致，可复用”交回给原 load。
+        if victim is not None:
+            for proxy in list(_PROXIES):
+                if proxy._ryh_real is victim or proxy._ryh_prev is victim:
+                    proxy.release()
 
     storage.unload = classmethod(safe_unload)
 
@@ -789,6 +821,9 @@ _TARGETS = (
 
 def apply_patch():
     """为所有已安装的反推插件目标安装缓存 patch。幂等；缺失的目标静默跳过。"""
+    if patches_disabled():
+        print(f"{LOG_PREFIX} {DISABLE_ENV} 已设置，跳过全部 patch（第三方节点保持原版行为）。", flush=True)
+        return False
     applied = False
     for target in _TARGETS:
         try:

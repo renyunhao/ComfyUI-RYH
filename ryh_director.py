@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 
 log = logging.getLogger("RYH.director_ref")
 
@@ -19,6 +20,17 @@ PKG = "ComfyUI_MiniMaxH3_Director"
 HOOK_MARK = "_ryh_run_hook"
 _HOOKS: list = []
 _warned_missing = False
+
+DISABLE_ENV = "RYH_DISABLE_PATCHES"
+_TRUES = ("1", "true", "yes", "on")
+
+
+def patches_disabled() -> bool:
+    """RYH_DISABLE_PATCHES=1 时，本包所有第三方节点补丁都不安装。
+
+    只用于 A/B 定位「崩在补丁上还是崩在环境上」：改了要重启 ComfyUI 才生效。
+    """
+    return os.environ.get(DISABLE_ENV, "").strip().lower() in _TRUES
 
 
 def _norm(path: str) -> str:

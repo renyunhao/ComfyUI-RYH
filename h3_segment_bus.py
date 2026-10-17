@@ -6,12 +6,15 @@ source_clip 已经是「全局 ∪ 本段」合并后的最终值（plan.py:884-
 刻把 plan 快照下来，并给导演台注入一个可选输入口 h3_bus 作为回传通道。
 
 回传发生在建 plan 之后、采样之前，所以段间引导、二采、缓存指纹全部照常工作。
-快照会常驻内存直到被下一次运行覆盖：全帧缓存下每段约 0.6GB（124×480×864 float）。
+快照里的画面张量（plan.source_video / seg.source_clip）能大到每段 0.6GB
+（124×480×864 float），所以总占用受 SNAPSHOT_BUDGET_BYTES 约束：超预算时从最旧的
+快照开始摘掉画面，只留文本与素材元信息（读节点会按 plan.raw 现解码，不受影响）。
 """
 
 from __future__ import annotations
 
 import collections
+import copy
 import datetime
 import inspect
 import logging
@@ -35,6 +38,8 @@ BUS_TYPE = "RYH_H3_BUS"
 BUS_INPUT = "h3_bus"
 MARKER = "_ryh_segment_bus"
 MAX_SNAPSHOTS = 2
+# 快照里画面张量的总内存预算；超出的部分从最旧快照开始只留文本与元信息
+SNAPSHOT_BUDGET_BYTES = 2 * 1024 ** 3
 
 # node_id -> snapshot
 SNAPSHOTS: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
@@ -128,6 +133,11 @@ def capture_fingerprint(prompt=None) -> None:
     global _RUN_FINGERPRINT
     import hashlib
 
+    # PENDING 只是「读节点建好 plan → 同一轮里导演台复用」的一次性交棒。导演台被
+    # 缓存跳过或 key 变了就没人 pop 它，那份 plan（带整段画面）会一直留到下次同名
+    # 交棒，所以每轮开头先清干净。
+    PENDING.clear()
+
     parts = []
     for nid, info in (prompt or {}).items():
         if not isinstance(info, dict) or info.get("class_type") != DIRECTOR_CLASS:
@@ -142,18 +152,71 @@ def _tensor_to_cpu(obj):
     return tensor().cpu() if callable(tensor) else obj
 
 
+def _nbytes(obj) -> int:
+    numel = getattr(obj, "numel", None)
+    itemsize = getattr(obj, "element_size", None)
+    if not callable(numel) or not callable(itemsize):
+        return 0
+    try:
+        return int(numel()) * int(itemsize())
+    except Exception:
+        return 0
+
+
+def _plan_bytes(plan) -> int:
+    """plan 里真正占内存的画面部分（refs 是若干张单帧图，量级小，不计入）。"""
+    total = _nbytes(getattr(plan, "source_video", None))
+    for seg in getattr(plan, "segments", None) or []:
+        total += _nbytes(getattr(seg, "source_clip", None))
+    return total
+
+
+def _strip_frames(plan):
+    """返回去掉画面张量的 plan 拷贝。
+
+    必须拷贝：这份 plan 就是导演台正在用的那个对象，就地清空会把本次生成的首帧
+    条件也一起弄没。摘掉后 resolve_segment_raw_clip 会走 plan.raw 现解码那条分支，
+    文本、段号、参考图、音频/视频引用全部保留。
+    """
+    stripped = copy.copy(plan)
+    stripped.source_video = torch.zeros((0, 1, 1, 3), dtype=torch.float32)
+    stripped.segments = []
+    for seg in getattr(plan, "segments", None) or []:
+        light = copy.copy(seg)
+        light.source_clip = None
+        stripped.segments.append(light)
+    return stripped
+
+
+def _enforce_budget() -> None:
+    """从最旧快照开始摘画面，直到总占用回到预算内；只动快照自己，不碰活的 plan。"""
+    while sum(int(snap.get("bytes", 0)) for snap in SNAPSHOTS.values()) > SNAPSHOT_BUDGET_BYTES:
+        over = next((snap for snap in SNAPSHOTS.values() if not snap.get("stripped")), None)
+        if over is None:
+            break
+        over["plan"] = _strip_frames(over["plan"])
+        over["bytes"] = 0
+        over["stripped"] = True
+        log.info("H3 Segment Bus: 快照超过 %s MB，已摘掉画面只留文本（段号/提示词/参考图仍在）",
+                 SNAPSHOT_BUDGET_BYTES // 1024 ** 2)
+
+
 def _snapshot(plan, node_id, notes, bus_seen=False, override_count=0) -> None:
     key = str(node_id or "last")
+    SNAPSHOTS.pop(key, None)  # 让本次快照排到 OrderedDict 末尾（最旧优先被摘画面）
     SNAPSHOTS[key] = {
         "time": datetime.datetime.now().isoformat(timespec="seconds"),
         "plan": plan,
         "count": len(getattr(plan, "segments", []) or []),
+        "bytes": _plan_bytes(plan),
+        "stripped": False,
         "notes": notes or [],
         "bus_seen": bus_seen,
         "override_count": override_count,
     }
     while len(SNAPSHOTS) > MAX_SNAPSHOTS:
         SNAPSHOTS.popitem(last=False)
+    _enforce_budget()
 
 
 def _apply_overrides(plan, bus) -> list[str]:
@@ -483,6 +546,8 @@ class H3DirectorSegmentPromptOverride:
 
 def install(*_args, **_kwargs) -> bool:
     """幂等；只在**已加载**的导演台模块上打补丁，绝不按裸名 import（会造出重复模块）。"""
+    if ref.patches_disabled():
+        return False
     module = ref.find("nodes.director")
     if module is None:
         ref.warn_missing_once("H3 Segment Bus")
@@ -616,7 +681,8 @@ class H3DirectorBusDoctor:
             lines.append("  导演台模块没找到：确认 ComfyUI_MiniMaxH3_Director 已安装且未被禁用")
             return ("\n".join(lines),)
         cls = getattr(module, DIRECTOR_CLASS, None)
-        lines.append(f"install() -> {install()}")
+        lines.append(f"install() -> {install()}"
+                     + ("（补丁被 %s 关掉了）" % ref.DISABLE_ENV if ref.patches_disabled() else ""))
         try:
             it = inspect.getattr_static(cls, "INPUT_TYPES")
             it_fn = getattr(it, "__func__", it)
@@ -637,7 +703,9 @@ class H3DirectorBusDoctor:
         lines.append(f"注册表里的类 is 同一个对象: {registered is cls}"
                      f"（注册={getattr(registered, '__module__', None)} / 补丁={getattr(cls, '__module__', None)}）")
         lines.append(f"快照数 {len(SNAPSHOTS)}: " + (", ".join(
-            f"{k}={snap['count']}段@{snap['time']}" for k, snap in SNAPSHOTS.items()) or "（空）"))
+            f"{k}={snap['count']}段/{snap.get('bytes', 0) / 1024 ** 2:.0f}MB"
+            f"{'（画面已摘除）' if snap.get('stripped') else ''}@{snap['time']}"
+            for k, snap in SNAPSHOTS.items()) or "（空）"))
         snap = get_snapshot()
         if snap:
             first = (getattr(snap["plan"], "segments", None) or [None])[0]
