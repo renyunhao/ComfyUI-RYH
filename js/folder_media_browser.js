@@ -15,13 +15,36 @@ const THUMB_SIZE_STEP = 8;
 const THUMB_SIZE_DEFAULT = 96;
 const THUMB_SIZE_STORE_KEY = "ComfyUI-RYH.folderMedia.thumbSize";
 
+// 删除二次确认开关（ComfyUI 设置面板项，默认开）
+const CONFIRM_DELETE_SETTING = "ComfyUI-RYH.LoadAtFolder.confirmDelete";
+let confirmSettingRegistered = false;
+
+const confirmDeleteSetting = {
+    id: CONFIRM_DELETE_SETTING,
+    name: isZH ? "LoadXXXAtFolder：删除文件前二次确认" : "LoadXXXAtFolder: confirm before deleting files",
+    category: ["ComfyUI-RYH", "目录媒体节点"],
+    type: "boolean",
+    defaultValue: true,
+    tooltip: isZH
+        ? "关闭后，🗑 按钮与 Shift+Delete 直接从磁盘删除，不再弹窗确认"
+        : "When off, the 🗑 button and Shift+Delete delete from disk without asking",
+    attributes: {},
+};
+
+function confirmBeforeDelete() {
+    // 只用单参形式：getSettingValue(id, default) 在 1.53 里已标记废弃，每次调用都会打警告。
+    // 读不到值（undefined）时按"要确认"处理：宁可多点一次，也不让误删变成默认行为。
+    const value = app.ui?.settings?.getSettingValue?.(CONFIRM_DELETE_SETTING);
+    return value !== false;
+}
+
 const LABEL = {
     gallery: isZH ? "▦ 画廊" : "▦ Gallery",
     preview: isZH ? "🖼 预览" : "🖼 Preview",
     folder: isZH ? "📁 目录" : "📁 Folder",
     remove: isZH ? "🗑 删除" : "🗑 Delete",
     thumb: isZH ? "缩略图" : "Thumb",
-    galleryHint: isZH ? "单击选中，◀ ▶ 切换" : "Click to select",
+    galleryHint: isZH ? "单击选中，◀ ▶ / ← → 切换" : "Click to select, ◀ ▶ / arrows to step",
 };
 
 // ---------- 通用小工具 ----------
@@ -142,6 +165,9 @@ function setupNode(node, config) {
 
     // —— 控制按钮栏：◀ ▶ 计数 [▦ 画廊] [🗑 删除] [📁 目录] ——
     const bar = document.createElement("div");
+    // 按钮栏和媒体区都要打标记：键盘让路规则靠它区分「我们自己的 DOM widget」
+    // 和别的节点的 widget，漏标会让点过 ◀ ▶ / 🗑 之后焦点落回本节点也认不出来。
+    bar.dataset.ryhFolderMedia = "1";
     bar.style.cssText = "display:flex;gap:4px;align-items:center;width:100%;padding:2px 0;";
     const makeBtn = (label, cb) => {
         const b = document.createElement("button");
@@ -164,7 +190,8 @@ function setupNode(node, config) {
     const modeBtn = makeBtn("", () => setMode(node, node._ryhMode === "gallery" ? "preview" : "gallery"));
     modeBtn.style.flex = "0 0 auto";
     node._ryhModeBtn = modeBtn;
-    const removeBtn = makeBtn(LABEL.remove, () => removeFile(node));
+    const removeBtn = makeBtn(LABEL.remove, () => deleteFiles([node]));
+    removeBtn.title = isZH ? `${LABEL.remove}（Shift+Delete）` : `${LABEL.remove} (Shift+Delete)`;
     removeBtn.style.color = "#e06c6c";
     node._ryhRemoveBtn = removeBtn;
     makeBtn(LABEL.folder, () => browseFolder(node));
@@ -182,6 +209,8 @@ function setupNode(node, config) {
     // 高度交给布局引擎自动分配：不覆盖 computeSize，保留内置 computeLayoutSize，
     // 布局引擎会把节点“剩余高度”分配给它；--comfy-widget-min-height 保证最小高度。
     const root = document.createElement("div");
+    // 标记成 RYH 区域，方向键白名单靠它判断焦点是否落在本节点上
+    root.dataset.ryhFolderMedia = "1";
     root.style.cssText =
         "width:100%;height:100%;flex-direction:column;overflow:hidden;background:rgba(0,0,0,0.25);--comfy-widget-min-height:60;display:none;";
 
@@ -349,36 +378,57 @@ function findFile(node, name) {
     return (node._ryhFiles || []).find((f) => f.name === name);
 }
 
-async function removeFile(node) {
-    const w = node._ryhFileWidget;
-    const folder = node._ryhFolderWidget?.value ?? "";
-    const name = w?.value ?? "none";
-    if (!name || name === "none") return;
-    const confirmed = window.confirm(
-        isZH ? `确定删除文件 "${name}" ？\n该操作会直接从磁盘移除文件，不可恢复！`
-             : `Delete file "${name}"?\nThis permanently removes the file from disk.`
-    );
-    if (!confirmed) return;
-    // 删除后优先显示下一个，没有则显示上一个，都为空时回到 none
-    const names = fileNames(node);
-    const idx = names.indexOf(name);
-    const preferred = idx === -1 ? "none" : (names[idx + 1] ?? names[idx - 1] ?? "none");
-    try {
-        const res = await api.fetchApi("/ryh/delete_file", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ folder, file: name }),
+// 🗑 按钮与 Shift+Delete 共用：选中多个节点时，一次删掉各自当前选中的文件
+async function deleteFiles(nodes) {
+    const items = [];
+    for (const node of nodes) {
+        const name = node._ryhFileWidget?.value ?? "none";
+        if (!name || name === "none") continue;
+        const names = fileNames(node);
+        const idx = names.indexOf(name);
+        items.push({
+            node,
+            folder: node._ryhFolderWidget?.value ?? "",
+            name,
+            // 删除后优先显示下一个，没有则显示上一个，都为空时回到 none
+            preferred: idx === -1 ? "none" : (names[idx + 1] ?? names[idx - 1] ?? "none"),
         });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok || !data.ok) {
-            showError(node, data.error || `删除失败 (HTTP ${res.status})`);
-            return;
-        }
-    } catch (e) {
-        showError(node, `删除请求失败: ${e}`);
-        return;
     }
-    await refreshFileList(node, preferred);
+    if (!items.length) return;
+
+    if (confirmBeforeDelete()) {
+        const tip = items.length === 1
+            ? (isZH ? `确定删除文件 "${items[0].name}" ？\n该操作会直接从磁盘移除文件，不可恢复！`
+                   : `Delete file "${items[0].name}"?\nThis permanently removes the file from disk.`)
+            : (isZH ? `确定删除这 ${items.length} 个文件？\n该操作会直接从磁盘移除文件，不可恢复！\n\n${items.map((i) => i.name).join("\n")}`
+                   : `Delete these ${items.length} files?\nThis permanently removes them from disk.\n\n${items.map((i) => i.name).join("\n")}`);
+        if (!window.confirm(tip)) return;
+    }
+
+    let deleted = 0;
+    const errors = [];
+    for (const item of items) {
+        try {
+            const res = await api.fetchApi("/ryh/delete_file", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ folder: item.folder, file: item.name }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.ok) {
+                errors.push(`${item.name}: ${data.error || `HTTP ${res.status}`}`);
+                continue;
+            }
+            deleted++;
+            await refreshFileList(item.node, item.preferred);
+        } catch (e) {
+            errors.push(`${item.name}: ${e}`);
+        }
+    }
+    if (errors.length) showError(nodes[0], errors.join("\n"));
+    if (deleted) {
+        showMessage(nodes[0], "success", isZH ? "已删除" : "Deleted", isZH ? `${deleted} 个文件` : `${deleted} file(s)`);
+    }
 }
 
 // 下拉、◀ ▶、缩略图点击都走这里，保证状态更新只有一套逻辑
@@ -402,6 +452,55 @@ function stepFile(node, dir) {
     let idx = names.indexOf(w.value);
     if (idx === -1) idx = dir > 0 ? -1 : 0;
     applySelection(node, names[(idx + dir + names.length) % names.length]);
+}
+
+// ---------- 键盘：← → 换文件，Shift+Delete 删当前文件 ----------
+
+// 为什么不用 node.onKeyDown：1.53 里 litegraph 只在 <canvas> 元素自己持有焦点时才
+// 分发它（canvas.addEventListener('keydown', …, true)）。Vue 节点模式下点节点标题
+// 命中的是节点 DOM，点缩略图命中的是 DOM widget，两种情况 onKeyDown 都不会被调用。
+// 因此挂 window 的**捕获阶段**：这比目标元素自身的处理器更早，才能从视频时间轴
+// (VideoFilmstripTrim 的 @keydown) 和前端快捷键服务（window bubble）手里把 ← → 拿回来。
+function selectedRyhNodes(config) {
+    const canvas = app.canvas;
+    const fromDict = canvas?.selected_nodes ? Object.values(canvas.selected_nodes) : [];
+    let nodes = fromDict.length ? fromDict : (canvas?.selectedItems ?? []).map((item) => item.node).filter(Boolean);
+    if (!nodes.length) nodes = (app.graph?._nodes ?? []).filter((n) => n.is_selected);
+    return nodes.filter((n) => n.comfyClass === config.nodeClass && n._ryhSetupDone);
+}
+
+function handleHotkey(e, config) {
+    if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+    // 方向键要求不带修饰键；删除只认 Shift+Delete —— 单键 Delete 和 Backspace
+    // 都被 ComfyUI 默认绑成 Comfy.Canvas.DeleteSelectedItems（删节点），不能抢。
+    const dir = e.shiftKey ? 0 : e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+    const toDelete = e.key === "Delete" && e.shiftKey;
+    if (!dir && !toDelete) return;
+    if (!(e.target instanceof Element)) return;
+    const target = e.target;
+
+    // 正在输入（含尺寸滑块）、弹层开着、焦点在播放器上做进度微调：一律让路
+    if (target.closest("input, textarea, select, [contenteditable='true']")) return;
+    if (target instanceof HTMLMediaElement) return;
+    if (target.closest("[role='dialog'], [role='listbox'], [role='menu'], .graphdialog, .litegraph-dialog")) return;
+
+    const nodes = selectedRyhNodes(config);
+    if (!nodes.length) return;
+
+    if (!target.closest("[data-ryh-folder-media]")) {
+        // 焦点明确落在别的节点或别的节点的 DOM widget 里（例如那条视频时间轴）时让给它
+        if (target.closest(".dom-widget")) return;
+        const owner = target.closest("[data-node-id]");
+        if (owner && !nodes.some((n) => String(n.id) === owner.dataset.nodeId)) return;
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+    if (toDelete) {
+        deleteFiles(nodes);
+    } else {
+        for (const node of nodes) stepFile(node, dir);
+    }
 }
 
 function updatePreview(node) {
@@ -540,23 +639,27 @@ function updateGallerySelection(node) {
     }
 }
 
-// 可见地提示错误（优先 ComfyUI toast，失败则用浏览器弹窗）
-function showError(node, msg) {
-    console.warn(`[${node._ryhConfig?.nodeClass ?? "FolderMedia"}]`, msg);
+// 可见地提示（优先 ComfyUI toast，失败则用浏览器弹窗）
+function showMessage(node, severity, summary, detail) {
+    if (severity === "error") console.warn(`[${node._ryhConfig?.nodeClass ?? "FolderMedia"}]`, detail);
     try {
         const toast = window.app?.extensionManager?.toast;
         if (toast && typeof toast.add === "function") {
-            toast.add({ severity: "error", summary: node._ryhConfig?.nodeClass, detail: msg, life: 6000 });
+            toast.add({ severity, summary, detail, life: 6000 });
             return;
         }
     } catch (e) {
         /* 忽略 toast 兼容问题，回退弹窗 */
     }
     try {
-        window.alert(msg);
+        window.alert(`${summary}\n${detail}`);
     } catch (e) {
         /* ignore */
     }
+}
+
+function showError(node, msg) {
+    showMessage(node, "error", node._ryhConfig?.nodeClass ?? "FolderMedia", msg);
 }
 
 async function browseFolder(node) {
@@ -578,10 +681,18 @@ async function browseFolder(node) {
 // ---------- 注册入口 ----------
 
 export function registerFolderMediaBrowser(config) {
-    const { nodeClass, fileWidget } = config;
+    const { nodeClass } = config;
+
+    window.addEventListener("keydown", (e) => handleHotkey(e, config), true);
+
+    // 三个节点共用一条设置；settingStore 按 id 去重但会打 "already registered"
+    // 警告，所以只挂第一次。
+    const settings = confirmSettingRegistered ? undefined : [confirmDeleteSetting];
+    confirmSettingRegistered = true;
 
     app.registerExtension({
         name: `ComfyUI-RYH.${nodeClass}`,
+        settings,
 
         // 新前端官方钩子：节点实例创建时调用（菜单新建 / 工作流加载均会触发）
         nodeCreated(node) {
