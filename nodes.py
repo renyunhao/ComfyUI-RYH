@@ -12,14 +12,12 @@ import subprocess
 import urllib.error
 import urllib.request
 
-import numpy as np
 import torch
-from PIL import Image, ImageOps, ImageSequence
+from PIL import Image
 
 import folder_paths
-import node_helpers
 
-from .media_core import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, resolve_media_path
+from .media_core import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, load_image, resolve_media_path
 
 
 class AnyType(str):
@@ -96,21 +94,7 @@ class LoadImageAtFolder:
                 folder_name,
             )
 
-        img = node_helpers.pillow(Image.open, image_path)
-        # 只取第一帧（多帧 GIF/webp 仅加载首帧）
-        frame = next(iter(ImageSequence.Iterator(img)))
-        frame = node_helpers.pillow(ImageOps.exif_transpose, frame)
-
-        image = frame.convert("RGB")
-        image_tensor = torch.from_numpy(np.array(image).astype(np.float32) / 255.0)[None,]
-
-        if "A" in frame.getbands():
-            mask = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
-            mask = 1.0 - torch.from_numpy(mask)
-        else:
-            mask = torch.zeros((64, 64), dtype=torch.float32)
-
-        img.close()
+        image_tensor, mask = load_image(image_path)
         # 把来源路径挂到 tensor 上（仅作元数据）：下游 caption_cache 会把
         # 它记录进缓存条目的 meta，方便人工核对；不参与缓存 key 计算。
         try:

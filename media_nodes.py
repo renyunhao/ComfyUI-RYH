@@ -2,6 +2,10 @@
 
 官方 LoadVideo / LoadAudio 只认 ComfyUI 的 input 目录，这两个节点把目录开放成
 任意路径：列举、缩略图、解码都由 media_core 提供，前端扩展负责画廊与播放。
+
+BrowseMediaAtFolder 是配套的复杂选择节点：全屏选择器在任意根目录里按目录树
+浏览、搜索，按扩展名输出 IMAGE / AUDIO / VIDEO；不做解码参数，视频用
+InputImpl.VideoFromFile 直接引用文件。
 """
 
 import os
@@ -182,3 +186,80 @@ class LoadAudioAtFolder:
             print(f"[LoadAudioAtFolder] 没有可用音轨: {media_path}，输出空。")
             return (None, "", folder_name, file_name)
         return (loaded, media_path, folder_name, file_name)
+
+
+class BrowseMediaAtFolder:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "folder": (
+                    "STRING",
+                    {
+                        "default": folder_paths.get_input_directory(),
+                        "multiline": False,
+                        "placeholder": "浏览根目录的完整路径",
+                        "tooltip": "选择器从这个目录开始向下浏览，可点节点上的 [📁 根目录] 按钮更换",
+                    },
+                ),
+                "kind": (
+                    ["all", "image", "video", "audio"],
+                    {
+                        "default": "all",
+                        "tooltip": "选择器过滤的类型；all 同时列出图片、视频和音频",
+                    },
+                ),
+                "file": (
+                    ["none"],
+                    {
+                        "default": "none",
+                        "tooltip": "相对根目录的文件路径，点 [🗂 浏览] 在全屏选择器里挑选",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "AUDIO", "VIDEO", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("image", "audio", "video", "path", "folder_name", "file_name", "media_kind")
+    FUNCTION = "load_media"
+    CATEGORY = "RYH/media"
+    DESCRIPTION = "复杂媒体选择节点：目录树 + 搜索 + 虚拟滚动的全屏选择器，在任意根目录里挑图片/视频/音频，按文件类型只填对应的一路输出（IMAGE / AUDIO / VIDEO），另附完整路径、目录名、文件名与媒体类型。视频不抽帧，直接输出官方 VIDEO 引用。"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        # file 下拉由前端选择器动态写入，跳过默认校验
+        return True
+
+    def load_media(self, folder, kind, file):
+        if not folder or not file or file == "none":
+            print("[BrowseMediaAtFolder] 未选择文件（none），输出空。")
+            return (_any_empty_image, None, None, "", "", "", "")
+
+        media_path = media_core.resolve_media_path(folder, file)
+        if not media_path or not os.path.isfile(media_path) or not media_core.is_allowed_media(media_path):
+            print(f"[BrowseMediaAtFolder] 文件不可用: {media_path or file}，输出空。")
+            return (_any_empty_image, None, None, media_path or "", "", "", "")
+
+        media_kind = media_core.media_kind(media_path)
+        folder_name = os.path.basename(os.path.dirname(media_path))
+        file_name = os.path.splitext(os.path.basename(media_path))[0]
+
+        image = None
+        audio = None
+        video = None
+        if media_kind == "image":
+            image, _mask = media_core.load_image(media_path)
+        elif media_kind == "video":
+            video = InputImpl.VideoFromFile(media_path)
+        elif media_kind == "audio":
+            audio = media_core.load_audio(media_path, 0.0, 0.0)
+
+        return (
+            image if image is not None else _any_empty_image,
+            audio,
+            video,
+            media_path,
+            folder_name,
+            file_name,
+            media_kind,
+        )
