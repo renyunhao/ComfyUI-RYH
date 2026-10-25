@@ -232,12 +232,15 @@ async def ryh_thumbnail(request):
     except ValueError:
         size = 128
     size = min(512, max(16, size))
+    fit = request.query.get("fit", "cover")
+    if fit not in ("cover", "contain"):
+        fit = "cover"
 
     path = media_core.resolve_media_path(folder, name)
     if not path or not os.path.isfile(path) or not media_core.is_allowed_media(path):
         return web.Response(status=404, text="file not found")
     # 大图缩放/视频取帧是同步 CPU 活，放在线程里做，别把事件循环和目录浏览一起卡住
-    data, etag = await asyncio.to_thread(media_core.build_thumbnail, path, size)
+    data, etag = await asyncio.to_thread(media_core.build_thumbnail, path, size, fit)
     if data is None:
         return web.Response(status=404, text="not a media file")
 

@@ -103,7 +103,7 @@ const CSS = `
 .ryh-pick-meta{display:flex;flex-direction:column;gap:4px;color:#9a9a9a;font-size:10px;line-height:1.45;word-break:break-all;flex-shrink:0}
 .ryh-pick-card{position:absolute;box-sizing:border-box;appearance:none;min-width:0;padding:4px;background:#161616;border:1px solid #333;border-radius:6px;color:#ddd;cursor:pointer;text-align:left;font:inherit;overflow:hidden}
 .ryh-pick-card:hover,.ryh-pick-card.selected{border-color:#6aa9ff;background:#1b2333}
-.ryh-pick-card img{display:block;width:100%;object-fit:cover;background:#090909;border-radius:4px}
+.ryh-pick-card img{display:block;width:100%;object-fit:contain;background:#0b0b0b;border-radius:4px}
 .ryh-pick-card .badge{position:absolute;right:8px;width:18px;height:18px;border-radius:9px;background:rgba(0,0,0,.55);color:#fff;font-size:9px;line-height:18px;text-align:center;pointer-events:none}
 .ryh-pick-card-name{display:block;padding:4px 2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:1.35}
 @media(max-width:768px){
@@ -174,7 +174,7 @@ function absFolder(root, subfolder) {
 }
 
 function thumbnailUrl(folder, name) {
-    const params = new URLSearchParams({ folder, file: name, size: String(THUMB_SIZE) });
+    const params = new URLSearchParams({ folder, file: name, size: String(THUMB_SIZE), fit: "contain" });
     return apiUrl(`/ryh/thumbnail?${params}`);
 }
 
@@ -472,7 +472,8 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
             const innerW = Math.max(1, galleryEl.clientWidth - 16);
             const cols = Math.max(1, Math.floor((innerW + CARD_GAP) / (CARD_MIN + CARD_GAP)));
             const cardW = Math.max(96, Math.floor((innerW - CARD_GAP * (cols - 1)) / cols));
-            return { cols, cardW, cardH: Math.round(cardW * 0.62) + 28 };
+            // 缩略图等比完整显示（contain），正方形格子对竖图/横图都最划算
+            return { cols, cardW, cardH: cardW + 28 };
         };
 
         const requestMeta = () => {
@@ -638,27 +639,36 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
             galleryEl.classList.add("is-empty");
         };
 
-        const scrollIntoView = () => {
+        const scrollIntoView = ({ center = false } = {}) => {
             const idx = rowsView.findIndex((item) => item.relPath === selectedValue);
             if (idx < 0) return;
-            if (view === "thumbs") {
-                const rowH = grid.cardH + CARD_GAP;
-                const top = Math.floor(idx / grid.cols) * rowH;
-                const viewH = galleryEl.clientHeight || 360;
-                if (top < galleryEl.scrollTop) galleryEl.scrollTop = top;
-                else if (top + grid.cardH > galleryEl.scrollTop + viewH) {
-                    galleryEl.scrollTop = top + grid.cardH - viewH;
+            const place = () => {
+                if (view === "thumbs") {
+                    const rowH = grid.cardH + CARD_GAP;
+                    const top = Math.floor(idx / grid.cols) * rowH;
+                    const viewH = galleryEl.clientHeight || 360;
+                    if (center) galleryEl.scrollTop = Math.max(0, top - (viewH - grid.cardH) / 2);
+                    else if (top < galleryEl.scrollTop) galleryEl.scrollTop = top;
+                    else if (top + grid.cardH > galleryEl.scrollTop + viewH) {
+                        galleryEl.scrollTop = top + grid.cardH - viewH;
+                    }
+                    return;
                 }
-                paintGallery();
-                return;
-            }
-            const top = idx * ROW_H;
-            const viewH = scrollerEl.clientHeight || 360;
-            if (top < scrollerEl.scrollTop) scrollerEl.scrollTop = top;
-            else if (top + ROW_H > scrollerEl.scrollTop + viewH) {
-                scrollerEl.scrollTop = top + ROW_H - viewH;
-            }
-            paintRows();
+                const top = idx * ROW_H;
+                const viewH = scrollerEl.clientHeight || 360;
+                if (center) scrollerEl.scrollTop = Math.max(0, top - viewH / 2 + ROW_H / 2);
+                else if (top < scrollerEl.scrollTop) scrollerEl.scrollTop = top;
+                else if (top + ROW_H > scrollerEl.scrollTop + viewH) {
+                    scrollerEl.scrollTop = top + ROW_H - viewH;
+                }
+            };
+            const paint = () => (view === "thumbs" ? paintGallery() : paintRows());
+            // 第一次滚动可能让竖滚动条出现，画廊列宽/卡高随之变化；
+            // 重画会重新测量，再定位一次才能正好落在目标上。
+            place();
+            paint();
+            place();
+            paint();
         };
 
         function select(item, { scroll = false } = {}) {
@@ -807,6 +817,8 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
                 } else {
                     renderBrowser();
                     renderPreview(selectedItem());
+                    // 打开时把当前文件滚到视野中间，而不是停在列表顶部
+                    scrollIntoView({ center: true });
                 }
                 updateStatus(data);
             } catch (err) {
@@ -883,6 +895,7 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
             rowsKey = "";
             cardsKey = "";
             renderBrowser();
+            scrollIntoView({ center: true });
             if (view === "thumbs") galleryEl.focus();
             else tableEl.focus();
         };

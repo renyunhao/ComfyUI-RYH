@@ -347,18 +347,20 @@ def _probe_container(path):
     return info
 
 
-def build_thumbnail(path, size):
+def build_thumbnail(path, size, fit="cover"):
     """返回 (webp 字节, etag)，失败 (None, None)。
 
-    图片等比裁切、视频取中间帧、音频画波形，全部输出正方形：画廊格子是
-    正方形 + object-fit: cover，等比缩放会让宽图在格子里只剩中间一条。
+    默认 fit="cover"：等比裁切后输出正方形，供简单节点的方形画廊格用。
+    fit="contain"：按长宽比缩放（长边 = size），不裁切，供需要完整构图的选择器用。
+    音频波形本身就是正方形，两种模式结果一致。
     """
     try:
         mtime_ns = os.stat(path).st_mtime_ns
     except OSError:
         return None, None
 
-    key = (os.path.normpath(path), mtime_ns, size)
+    fit = "contain" if fit == "contain" else "cover"
+    key = (os.path.normpath(path), mtime_ns, size, fit)
     hit = _thumbnail_cache.get(key)
     if hit is not None:
         _thumbnail_cache.move_to_end(key)
@@ -376,12 +378,12 @@ def build_thumbnail(path, size):
             return None, None
         if source is None:
             return None, None
-        data = _fit_to_webp(source, size)
+        data = _fit_to_webp(source, size, fit)
     except Exception as e:
         print(f"[ComfyUI-RYH] 缩略图生成失败 {path}: {e}")
         return None, None
 
-    entry = (data, f'W/"{mtime_ns:x}-{size}"')
+    entry = (data, f'W/"{mtime_ns:x}-{size}-{fit}"')
     _thumbnail_cache[key] = entry
     while len(_thumbnail_cache) > _THUMBNAIL_CACHE_LIMIT:
         _thumbnail_cache.popitem(last=False)
@@ -447,8 +449,11 @@ def _waveform_image(path, size):
     return image
 
 
-def _fit_to_webp(image, size):
-    image = ImageOps.fit(image, (size, size), Image.LANCZOS)
+def _fit_to_webp(image, size, fit="cover"):
+    if fit == "contain":
+        image = ImageOps.contain(image, (size, size), Image.LANCZOS)
+    else:
+        image = ImageOps.fit(image, (size, size), Image.LANCZOS)
     if image.mode not in ("RGB", "RGBA"):
         image = image.convert("RGB")
     buffer = BytesIO()
