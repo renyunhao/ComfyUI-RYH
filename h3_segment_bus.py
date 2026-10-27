@@ -5,6 +5,10 @@ DirectorPlan；plan.segments[i] 里的 prompt / refs / ref_audios / ref_videos /
 source_clip 已经是「全局 ∪ 本段」合并后的最终值（plan.py:884-903）。本模块在那一
 刻把 plan 快照下来，并给导演台注入一个可选输入口 h3_bus 作为回传通道。
 
+读节点可选接 groups（与导演台同一路 MMX_DIR_GROUP）：接了就用外接组建 plan，
+提示词与导演台真正执行的完全一致；不接只读 UI 时间轴——外接组会覆盖时间轴，
+这时回写链看到的原文是旧卡片，改 Group 提示词不会生效。
+
 回传发生在建 plan 之后、采样之前，所以段间引导、二采、缓存指纹全部照常工作。
 快照里的画面张量（plan.source_video / seg.source_clip）能大到每段 0.6GB
 （124×480×864 float），所以总占用受 SNAPSHOT_BUDGET_BYTES 约束：超预算时从最旧的
@@ -36,6 +40,13 @@ DIRECTOR_CLASS = "MiniMaxH3Director"
 PLAN_FUNC = "prepare_director_plan"
 BUS_TYPE = "RYH_H3_BUS"
 BUS_INPUT = "h3_bus"
+# 与导演台 Group 节点同一个类型串：读节点接同一路组，才能按外接组建 plan。
+GROUP_TYPE = "MMX_DIR_GROUP"
+GROUP_TOOLTIP = (
+    "把导演台 r2v_groups / i2v_groups 的同一路 Group（或 Groups Combine）也接进来，"
+    "读节点才会按外接组提示词建 plan。不接 = 只读 UI 时间轴；"
+    "外接组会覆盖时间轴，两边原文不一致时回写会写到旧文本上。"
+)
 MARKER = "_ryh_segment_bus"
 MAX_SNAPSHOTS = 2
 # 快照里画面张量的总内存预算；超出的部分从最旧快照开始只留文本与元信息
@@ -45,12 +56,13 @@ SNAPSHOT_BUDGET_BYTES = 2 * 1024 ** 3
 SNAPSHOTS: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
 # 读节点从本次 prompt 直接建出来的 plan，供导演台复用（一次生效的关键）
 PENDING: dict = {}
-_RUN: dict = {"bus": None, "node_id": None}
+_RUN: dict = {"bus": None, "node_id": None, "base": None}
 
 PLAN_SCALARS = ("timeline_data", "task_type", "global_prompt", "total_frames",
                 "frame_rate", "width", "height", "ref_max_size")
 PLAN_OBJECTS = ("i2v_groups", "r2v_groups", "selflift", "semantic_bridge",
                 "refine", "face_refine")
+GROUP_INPUTS = ("i2v_groups", "r2v_groups")
 
 
 def _is_link(value) -> bool:
@@ -62,14 +74,49 @@ def _plan_key(values: dict) -> tuple:
     return tuple(str(values.get(name, "")) for name in PLAN_SCALARS)
 
 
+def _group_kwargs(groups) -> dict:
+    """把单组 / Combine 列表映射到 prepare_director_plan 的组参数。"""
+    if groups is None:
+        return {}
+    items = groups if isinstance(groups, (list, tuple)) else [groups]
+    items = [g for g in items if isinstance(g, dict)]
+    if not items:
+        return {}
+    if all(str(g.get("kind") or g.get("family") or "") == "r2v" for g in items):
+        return {"r2v_groups": groups}
+    return {"i2v_groups": groups}
+
+
+def _wired_widget_parts(prompt: dict, node_id: str) -> list:
+    """某个节点及其全部上游的控件值（连线只用于继续向上走）。"""
+    parts, seen, stack = [], set(), [str(node_id)]
+    while stack:
+        nid = stack.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        info = prompt.get(nid) or {}
+        inputs = info.get("inputs") or {}
+        parts.append((nid, str(info.get("class_type") or ""), tuple(
+            (str(key), str(value))
+            for key, value in sorted(inputs.items())
+            if not _is_link(value)
+        )))
+        stack.extend(str(value[0]) for value in inputs.values() if _is_link(value))
+    return sorted(parts)
+
+
 def director_node_ids(dynprompt) -> list:
     prompt = dynprompt.get_original_prompt() if dynprompt is not None else {}
     return [nid for nid, info in (prompt or {}).items()
             if isinstance(info, dict) and info.get("class_type") == DIRECTOR_CLASS]
 
 
-def live_plan(dynprompt, selector: str = ""):
+def live_plan(dynprompt, selector: str = "", groups=None):
     """从本次 Queue 的 prompt 里直接建 DirectorPlan —— 所以一次 Queue 就生效。
+
+    ``groups`` 接导演台同一路 MMX_DIR_GROUP：接了就按外接组建 plan（提示词与导演台
+    完全一致）；不接只能读 UI 时间轴，外接组覆盖时间轴时两边原文会对不上。
 
     返回 (plan, node_id, note)；拿不到就返回 (None, None, 原因)，调用方回退到快照。
     """
@@ -92,26 +139,39 @@ def live_plan(dynprompt, selector: str = ""):
     if unusable:
         return None, None, f"导演台 {node_id} 这些输入是连线值/缺失，无法离线解析：{unusable}"
     values = {name: inputs[name] for name in PLAN_SCALARS}
+    group_values = _group_kwargs(groups)
     common = ref.find("nodes.director_common")
     if common is None:
         return None, None, "找不到已加载的 nodes.director_common"
     try:
-        plan = getattr(common, PLAN_FUNC)(unique_id=node_id, **values)
+        plan = getattr(common, PLAN_FUNC)(unique_id=node_id, **values, **group_values)
     except Exception as error:
         log.warning("H3 Segment Bus: 现场建 plan 失败 (%s)", error)
         return None, None, f"现场建 plan 失败：{error}"
     # 导演台接了 selflift/refine/外部组等图对象时不能复用那份 plan ——
     # 这些附件只有在导演台自己执行时才拿得到，复用得丢配置。
+    # 外接组同样不复用：组的画面张量只有导演台执行时才拿到最新的一版。
     attached = [name for name in PLAN_OBJECTS if _is_link(inputs.get(name))]
-    if not attached:
+    if not attached and not group_values:
         PENDING[str(node_id)] = {"plan": plan, "key": _plan_key(values)}
-    return plan, node_id, ("现场建 plan（节点 %s，复用=%s）"
-                           % (node_id, "否，已接 " + str(attached) if attached else "是"))
+    # 本轮读节点看到的原文；回写时只有导演台当前原文与它一致才覆盖，
+    # 避免回写链拿到的是旧文本却盖掉刚改过的新提示词。
+    _RUN["base"] = {
+        "node": str(node_id),
+        "prompts": [str(getattr(seg, "prompt", "") or "") for seg in (plan.segments or [])],
+    }
+    source = "外接组" if group_values else "时间轴"
+    reuse = "否" if attached or group_values else "是"
+    return plan, node_id, (
+        f"现场建 plan（节点 {node_id}，{source}"
+        + ("，已接 " + str(attached) if attached else "")
+        + f"，复用={reuse}）"
+    )
 
 
-def resolve_plan(dynprompt, selector: str):
+def resolve_plan(dynprompt, selector: str, groups=None):
     """先现场建 plan，失败再退回上一次 Queue 的快照。"""
-    plan, node_id, note = live_plan(dynprompt, selector)
+    plan, node_id, note = live_plan(dynprompt, selector, groups)
     if plan is not None:
         return plan, note
     snap = get_snapshot()
@@ -137,13 +197,23 @@ def capture_fingerprint(prompt=None) -> None:
     # 缓存跳过或 key 变了就没人 pop 它，那份 plan（带整段画面）会一直留到下次同名
     # 交棒，所以每轮开头先清干净。
     PENDING.clear()
+    # 回写原文校验同理：只认本轮读节点建 plan 时看到的文本。
+    _RUN["base"] = None
 
     parts = []
     for nid, info in (prompt or {}).items():
         if not isinstance(info, dict) or info.get("class_type") != DIRECTOR_CLASS:
             continue
         inputs = info.get("inputs") or {}
-        parts.append((str(nid),) + tuple(str(inputs.get(k, "")) for k in PLAN_SCALARS))
+        part = (str(nid),) + tuple(str(inputs.get(k, "")) for k in PLAN_SCALARS)
+        # 外接组是连线输入，控件值不在导演台自己的 inputs 里。不带整条 Group 链路
+        # 的控件值时，只改 Group 提示词会让读节点命中 ComfyUI 缓存，回写链继续吐旧文本。
+        part += tuple(
+            (name, tuple(_wired_widget_parts(prompt, str(inputs[name][0]))))
+            for name in GROUP_INPUTS
+            if _is_link(inputs.get(name))
+        )
+        parts.append(part)
     _RUN_FINGERPRINT = hashlib.md5(repr(sorted(parts)).encode("utf-8")).hexdigest()[:16] if parts else ""
 
 
@@ -219,15 +289,29 @@ def _snapshot(plan, node_id, notes, bus_seen=False, override_count=0) -> None:
     _enforce_budget()
 
 
-def _apply_overrides(plan, bus) -> list[str]:
+def _apply_overrides(plan, bus, node_id=None) -> list[str]:
     """把 override 节点攒的 {段序: 新提示词} 写进合并后的 plan。"""
     overrides = (bus or {}).get("overrides") or {}
+    base = _RUN.get("base") or {}
+    base_prompts = (
+        base.get("prompts")
+        if str(base.get("node") or "") == str(node_id or "")
+        else None
+    )
     notes: list[str] = []
     segments = getattr(plan, "segments", None) or []
     for seg in segments:
         idx = int(getattr(seg, "index", 0))
         text = overrides.get(idx, overrides.get(-1))
         if text is None:
+            continue
+        if (
+            isinstance(base_prompts, list)
+            and 0 <= idx < len(base_prompts)
+            and str(getattr(seg, "prompt", "") or "") != base_prompts[idx]
+        ):
+            # 读节点本轮建过 plan，但导演台当前原文与它不一致：用旧回写会盖掉新提示词。
+            notes.append(f"段 {idx}: 原文已变（回写链看到的是另一版），跳过回写")
             continue
         text = str(text)
         if text == getattr(seg, "prompt", ""):
@@ -330,6 +414,7 @@ class H3DirectorSegment:
                 "director_node": ("STRING", {"default": "", "tooltip":
                     "留空 = 自动找本图里唯一的 MiniMaxH3Director 节点；"
                     "有多台时填其中之一的节点 id（见 H3Director Bus Doctor）"}),
+                "groups": (GROUP_TYPE, {"tooltip": GROUP_TOOLTIP}),
             },
             "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"},
         }
@@ -346,9 +431,9 @@ class H3DirectorSegment:
         return f"{_RUN_FINGERPRINT}|{segment_index}|{max_frames_per_segment}|{director_node}"
 
     def read(self, segment_index=0, max_frames_per_segment=8, director_node="",
-             dynprompt=None, unique_id=None):
+             groups=None, dynprompt=None, unique_id=None):
         empty = torch.zeros((1, 16, 16, 3))
-        plan, note = resolve_plan(dynprompt, director_node)
+        plan, note = resolve_plan(dynprompt, director_node, groups)
         if plan is None:
             return ("", "", 0, 0, 0, empty, empty.clone(), f"读不到分段：{note}")
         segments = getattr(plan, "segments", None) or []
@@ -404,6 +489,7 @@ class H3DirectorSegmentList:
             "optional": {
                 "director_node": ("STRING", {"default": "", "tooltip":
                     "留空 = 自动找本图里唯一的 MiniMaxH3Director；多台时填节点 id"}),
+                "groups": (GROUP_TYPE, {"tooltip": GROUP_TOOLTIP}),
             },
             "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"},
         }
@@ -419,8 +505,9 @@ class H3DirectorSegmentList:
     def IS_CHANGED(cls, max_frames_per_segment=8, director_node="", **kwargs):
         return f"{_RUN_FINGERPRINT}|{max_frames_per_segment}|{director_node}"
 
-    def read(self, max_frames_per_segment=8, director_node="", dynprompt=None, unique_id=None):
-        plan, note = resolve_plan(dynprompt, director_node)
+    def read(self, max_frames_per_segment=8, director_node="", groups=None,
+             dynprompt=None, unique_id=None):
+        plan, note = resolve_plan(dynprompt, director_node, groups)
         segments = list(getattr(plan, "segments", None) or []) if plan is not None else []
         prompts, keys, counts, frames, refs = [], [], [], [], []
         placeholder = torch.zeros((1, 16, 16, 3))
@@ -629,7 +716,10 @@ def _patch_plan_func(module) -> None:
             plan = original(*args, **kwargs)
         try:
             bus = _RUN.get("bus")
-            notes = _apply_overrides(plan, bus) if bus else []
+            notes = (
+                _apply_overrides(plan, bus, kwargs.get("unique_id") or _RUN.get("node_id"))
+                if bus else []
+            )
             _snapshot(plan, kwargs.get("unique_id") or _RUN.get("node_id"), notes,
                       bus_seen=bool(bus),
                       override_count=len((bus or {}).get("overrides") or {}))
