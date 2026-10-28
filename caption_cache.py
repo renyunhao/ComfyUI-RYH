@@ -591,6 +591,22 @@ _POLICY_TOOLTIP = "接 Caption Cache Policy (RYH)：决定本节点是否读写�
 # 目标 1：comfyui-llama-TE（QwenTE图像推理）
 # ---------------------------------------------------------------------------
 
+def _cuda_memory_gb():
+    """返回 (free, total, torch allocated) GiB；CUDA 不可用时返回 None。
+
+    llama.cpp 的显存不在 torch 的分配统计里，用 mem_get_info 才能看到卸载前后
+    真实的空闲量。
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        free, total = torch.cuda.mem_get_info()
+        return free / 1024 ** 3, total / 1024 ** 3, torch.cuda.memory_allocated() / 1024 ** 3
+    except Exception:
+        return None
+
+
 def _install_qwen_patch(mod):
     storage = mod._QwenStorage
     infer_cls = mod.QwenTE图像推理
@@ -649,6 +665,14 @@ def _install_qwen_patch(mod):
             for proxy in list(_PROXIES):
                 if proxy._ryh_real is victim or proxy._ryh_prev is victim:
                     proxy.release()
+            mem = _cuda_memory_gb()
+            if mem is not None:
+                free, total, alloc = mem
+                print(
+                    f"{LOG_PREFIX} [QwenTE] 模型已卸载：CUDA free {free:.2f}/{total:.2f} GiB"
+                    f"（torch 持有 {alloc:.2f} GiB）",
+                    flush=True,
+                )
 
     storage.unload = classmethod(safe_unload)
 
@@ -672,7 +696,18 @@ def _install_qwen_patch(mod):
         if policy == POLICY_CACHE:
             cached = get(key)
             if cached is not None:
-                print(f"{LOG_PREFIX} [QwenTE] 命中缓存，跳过反推（模型未加载）。", flush=True)
+                # 命中时原 run 被跳过，这里补上它「生成后自动卸载模型」的副作用，
+                # 否则上一条 miss 加载的模型会一直驻留到下游开始加载。
+                unloaded = False
+                if bool(kwargs.get("生成后自动卸载模型")):
+                    cur = storage.model
+                    if isinstance(cur, _LazyQwenModel):
+                        cur = cur._ryh_real if cur._ryh_real is not None else cur._ryh_prev
+                    if cur is not None:
+                        storage.unload()
+                        unloaded = True
+                suffix = "，已按设置卸载模型" if unloaded else "（模型未加载）"
+                print(f"{LOG_PREFIX} [QwenTE] 命中缓存，跳过反推{suffix}。", flush=True)
                 return (cached,)
 
         # 走到这里就是要真反推：把懒代理解析成真实模型，避免原 run 内部触发二次加载
