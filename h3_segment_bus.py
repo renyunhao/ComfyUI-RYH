@@ -57,6 +57,8 @@ SNAPSHOTS: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
 # 读节点从本次 prompt 直接建出来的 plan，供导演台复用（一次生效的关键）
 PENDING: dict = {}
 _RUN: dict = {"bus": None, "node_id": None, "base": None}
+# 「导演台接了外接组、读节点没接 groups」每轮只提醒一次（单段读节点常有一堆实例）
+_GROUPS_UNWIRED_WARNED: set = set()
 
 PLAN_SCALARS = ("timeline_data", "task_type", "global_prompt", "total_frames",
                 "frame_rate", "width", "height", "ref_max_size")
@@ -140,6 +142,8 @@ def live_plan(dynprompt, selector: str = "", groups=None):
         return None, None, f"导演台 {node_id} 这些输入是连线值/缺失，无法离线解析：{unusable}"
     values = {name: inputs[name] for name in PLAN_SCALARS}
     group_values = _group_kwargs(groups)
+    attached = [name for name in PLAN_OBJECTS if _is_link(inputs.get(name))]
+    director_groups = [name for name in GROUP_INPUTS if _is_link(inputs.get(name))]
     common = ref.find("nodes.director_common")
     if common is None:
         return None, None, "找不到已加载的 nodes.director_common"
@@ -151,7 +155,6 @@ def live_plan(dynprompt, selector: str = "", groups=None):
     # 导演台接了 selflift/refine/外部组等图对象时不能复用那份 plan ——
     # 这些附件只有在导演台自己执行时才拿得到，复用得丢配置。
     # 外接组同样不复用：组的画面张量只有导演台执行时才拿到最新的一版。
-    attached = [name for name in PLAN_OBJECTS if _is_link(inputs.get(name))]
     if not attached and not group_values:
         PENDING[str(node_id)] = {"plan": plan, "key": _plan_key(values)}
     # 本轮读节点看到的原文；回写时只有导演台当前原文与它一致才覆盖，
@@ -160,7 +163,16 @@ def live_plan(dynprompt, selector: str = "", groups=None):
         "node": str(node_id),
         "prompts": [str(getattr(seg, "prompt", "") or "") for seg in (plan.segments or [])],
     }
-    source = "外接组" if group_values else "时间轴"
+    if group_values:
+        source = "外接组"
+    elif director_groups:
+        # 导演台用外接组，这里只能读时间轴：两边原文必然对不上，回写会被原文校验跳过。
+        source = f"时间轴（导演台接了 {director_groups}，本节点 groups 未接，原文与执行值不一致）"
+        if str(node_id) not in _GROUPS_UNWIRED_WARNED:
+            _GROUPS_UNWIRED_WARNED.add(str(node_id))
+            log.warning("H3 Segment Bus: %s", source)
+    else:
+        source = "时间轴"
     reuse = "否" if attached or group_values else "是"
     return plan, node_id, (
         f"现场建 plan（节点 {node_id}，{source}"
@@ -199,6 +211,7 @@ def capture_fingerprint(prompt=None) -> None:
     PENDING.clear()
     # 回写原文校验同理：只认本轮读节点建 plan 时看到的文本。
     _RUN["base"] = None
+    _GROUPS_UNWIRED_WARNED.clear()
 
     parts = []
     for nid, info in (prompt or {}).items():
