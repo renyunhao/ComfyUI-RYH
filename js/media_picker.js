@@ -328,6 +328,8 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
         let rowsView = [];
         let rowsStamp = 0;
         let selectedValue = current || "";
+        // 首次打开把当前目录在树里居中；之后只最小幅度滚动，避免点目录时整棵树跳动
+        let pendingTreeCenter = !!startRel;
         let loadSeq = 0;
         let rowEls = new Map();
         let cardEls = new Map();
@@ -699,7 +701,22 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
             void load();
         };
 
-        const renderTree = () => {
+        // 树可能有上百个目录，只打高亮不滚动的话当前目录会停在可视区外
+        const revealActiveTreeNode = ({ center = false } = {}) => {
+            const active = treeEl.querySelector(".ryh-pick-node.active");
+            if (!active) return;
+            const node = active.getBoundingClientRect();
+            const frame = treeEl.getBoundingClientRect();
+            if (center) {
+                const offset = treeEl.scrollTop + (node.top - frame.top) - (treeEl.clientHeight - node.height) / 2;
+                treeEl.scrollTop = Math.max(0, offset);
+                return;
+            }
+            if (node.top < frame.top) treeEl.scrollTop += node.top - frame.top;
+            else if (node.bottom > frame.bottom) treeEl.scrollTop += node.bottom - frame.bottom;
+        };
+
+        const renderTree = ({ reveal = false, center = false } = {}) => {
             treeEl.textContent = "";
             const rootBtn = document.createElement("button");
             rootBtn.type = "button";
@@ -743,6 +760,7 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
                 treeEl.appendChild(row);
                 if (!expanded.has(node.relPath)) hiddenBelow = node.depth;
             }
+            if (reveal) revealActiveTreeNode({ center });
         };
 
         const renderCrumbs = () => {
@@ -809,7 +827,8 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
                     selectedValue = rowsView[0]?.relPath || "";
                 }
                 syncHeader();
-                renderTree();
+                renderTree({ reveal: true, center: pendingTreeCenter });
+                pendingTreeCenter = false;
                 renderCrumbs();
                 if (!rowsView.length) {
                     setEmpty(query ? L.emptySearch : L.empty);
