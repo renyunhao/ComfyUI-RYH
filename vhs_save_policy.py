@@ -1,12 +1,20 @@
-"""给 Video Helper Suite 的 Video Combine 🎥🅥🅗🅢 节点加一个「只保留带音频副本」开关。
+"""给 Video Helper Suite 的 Video Combine 🎥🅥🅗🅢 节点加「保存哪份视频」选项。
 
 原版行为：接了 audio 输入时，先写出无声视频 `xxx_00001.mp4`，再 mux 出
-`xxx_00001-audio.mp4`，两个文件都留在 output 目录里。
+`xxx_00001-audio.mp4`，两个文件都留在 output 目录里，输出列表末尾是
+[... , 无声视频, -audio 视频]。
 
-补丁行为：Video Combine 上多出一个 `only_save_with_audio` 开关（默认 False）。
-关掉时与原版完全一致；打开时在原函数返回后删掉无声副本，并把 VHS_FILENAMES
-输出与预览一并收敛到带音频那一个文件。没有接 audio 时无声副本就是唯一产物，
-开关不做任何事。
+补丁行为：Video Combine 的 optional 里多出一个 `save_audio_mode` 下拉：
+- 都保存（默认）：与原版完全一致，两份视频都留着；
+- 有音频：删掉无声副本，只留 -audio 那份（原布尔开关 True 的行为）；
+- 无音频：删掉 -audio 副本，只留无声那份。
+两种单选模式都会同步收敛 VHS_FILENAMES 输出与节点预览，避免预览指向被删掉的文件。
+没接 audio 时只有一份无声视频，选项不做任何事。
+
+旧版补丁用的是布尔开关 `only_save_with_audio`；这里后端仍兼容该参数
+（老 prompt 直传时映射成「有音频」），前端由 js/vhs_save_policy.js 负责把
+旧工作流里保存的布尔值迁移到新下拉。任何认不出的值都回退到「都保存」，
+绝不因为解析失败而误删文件。
 
 实现方式是对第三方节点做 monkey-patch，不修改任何第三方源文件：
 注入 widget 靠包一层 `INPUT_TYPES`，清理逻辑包在 `combine_video` 外面。
@@ -21,18 +29,47 @@ except ImportError:  # 直接按目录导入（离线测试用）
 
 LOG_PREFIX = "[RYH VideoCombine]"
 
-_WIDGET_NAME = "only_save_with_audio"
+_WIDGET_NAME = "save_audio_mode"
+_LEGACY_WIDGET_NAME = "only_save_with_audio"
+MODE_ALL = "都保存"
+MODE_NO_AUDIO = "无音频"
+MODE_WITH_AUDIO = "有音频"
+_MODES = [MODE_ALL, MODE_NO_AUDIO, MODE_WITH_AUDIO]
 _WIDGET_TOOLTIP = (
     "仅在接了 audio 输入时生效：\n"
-    "False（默认）= 与原版一致，无声视频和 -audio 视频都保存；\n"
-    "True = 写完 -audio 视频后删掉无声那份，只保留带音频的。"
+    "都保存（默认）= 与原版一致，无声视频和 -audio 视频都保留；\n"
+    "有音频 = 只保留 -audio 视频，删除无声副本；\n"
+    "无音频 = 只保留无声视频，删除 -audio 副本。\n"
+    "VHS_FILENAMES 输出与节点预览会同步指向保留的那份。"
 )
 _IT_MARKER = "_ryh_vhs_save_policy_input"
 _PATCHED_FLAG = "_ryh_vhs_save_policy_patched"
 
 
-def _inject_switch(cls):
-    """往 Video Combine 的 optional 里注入一个 BOOLEAN widget（默认 False）。"""
+def _normalize_mode(value):
+    """把前端传来的值收敛到三个选项，兼容旧布尔开关与常见英文别名。"""
+    if value is None:
+        return MODE_ALL
+    if isinstance(value, bool):
+        return MODE_WITH_AUDIO if value else MODE_ALL
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in (MODE_ALL, "all", "both", "keep all", "全部", ""):
+            return MODE_ALL
+        if v in (MODE_NO_AUDIO, "no audio", "no_audio", "without audio", "silent", "mute", "无声", "不带音频"):
+            return MODE_NO_AUDIO
+        if v in (MODE_WITH_AUDIO, "with audio", "with_audio", "audio", "audio only", "only audio", "带音频"):
+            return MODE_WITH_AUDIO
+        # 老 API / 老前端可能把布尔开关传成字符串
+        if v in ("true", "1", "on", "yes"):
+            return MODE_WITH_AUDIO
+        if v in ("false", "0", "off", "no"):
+            return MODE_ALL
+    return MODE_ALL  # 未知值一律退回原版行为
+
+
+def _inject_widget(cls):
+    """往 Video Combine 的 optional 里注入一个 combo widget（默认「都保存」）。"""
     if getattr(cls.INPUT_TYPES, _IT_MARKER, False):
         return
 
@@ -47,9 +84,11 @@ def _inject_switch(cls):
 
     def input_types(klass):
         spec = original(klass)
-        spec.setdefault("optional", {})[_WIDGET_NAME] = (
-            "BOOLEAN",
-            {"default": False, "tooltip": _WIDGET_TOOLTIP},
+        optional = spec.setdefault("optional", {})
+        optional.pop(_LEGACY_WIDGET_NAME, None)  # 万一是热重载到旧版定义，别留两个控件
+        optional[_WIDGET_NAME] = (
+            list(_MODES),
+            {"default": MODE_ALL, "tooltip": _WIDGET_TOOLTIP},
         )
         return spec
 
@@ -86,56 +125,89 @@ def _output_files(result):
     return files if isinstance(files, list) else None
 
 
-def _drop_silent(result):
-    """删掉无声副本并把输出列表收敛到带音频那份；返回被删路径或 None。"""
+def _preview(result):
+    """拿节点预览 dict；VHS 在 batched 未完成时没有 gifs。"""
+    gifs = (result.get("ui") or {}).get("gifs")
+    if isinstance(gifs, list) and gifs and isinstance(gifs[0], dict):
+        return gifs[0]
+    return None
+
+
+def _keep_only(result, keep_audio):
+    """删掉不需要的那份，把输出列表与预览收敛到保留的那份。
+
+    返回 True 表示识别到成对产物并做出处理（含明确提示过的放弃分支），
+    False 表示没找到成对产物或删除失败，交由调用方决定是否提示。
+    """
     files = _output_files(result)
     found = _audio_path(files) if files else None
     if found is None:
-        return None
-    _, silent = found
-    if os.path.isfile(silent):
+        return False
+    audio, silent = found
+    keep, drop = (audio, silent) if keep_audio else (silent, audio)
+    label = "无声副本" if keep_audio else "带音频副本"
+
+    # 选「无音频」时若无声母本已被 VHS 自己删掉（workflow 里开了
+    # VHS_KeepIntermediate=False），再删 audio 就一份视频都不剩，直接放弃清理。
+    if not keep_audio and not os.path.isfile(silent):
+        print(
+            f"{LOG_PREFIX} 选择「{MODE_NO_AUDIO}」但无声副本已不存在（检查 workflow 的 "
+            "VHS_KeepIntermediate 设置），保留带音频副本。",
+            flush=True,
+        )
+        return True
+
+    if os.path.isfile(drop):
         try:
-            os.remove(silent)
+            os.remove(drop)
         except OSError as e:
-            print(f"{LOG_PREFIX} 无法删除无声副本: {e}", flush=True)
-            return None
-    else:
-        silent = None
-    files.pop(-2)
-    preview = (result.get("ui") or {}).get("gifs")
-    if preview and preview[0].get("fullpath") not in (None, files[-1]):
-        preview[0]["fullpath"] = files[-1]
-    return silent
+            print(f"{LOG_PREFIX} 无法删除{label} {os.path.basename(drop)}: {e}", flush=True)
+            return False
+        print(f"{LOG_PREFIX} [{MODE_WITH_AUDIO if keep_audio else MODE_NO_AUDIO}] "
+              f"已删除{label}：{os.path.basename(drop)}", flush=True)
+
+    # audio 恒为最后一项、silent 恒为倒数第二项；收敛后 files[-1] 就是保留的那份
+    files.pop(-2 if keep_audio else -1)
+    preview = _preview(result)
+    if preview is not None:
+        preview["filename"] = os.path.basename(keep)
+        preview["fullpath"] = keep
+    return True
 
 
 def _install(cls):
     if getattr(cls, _PATCHED_FLAG, False):
         return True
-    _inject_switch(cls)
+    _inject_widget(cls)
 
     original_combine = cls.combine_video
 
     def combine_video(self, *args, **kwargs):
-        keep_audio_only = kwargs.pop(_WIDGET_NAME, False)
-        # 开关打开却什么都没清：接了 audio 说明是补丁失效（对方改了输出形态），
+        raw_mode = kwargs.pop(_WIDGET_NAME, None)
+        # 旧布尔开关已不在 INPUT_TYPES 里，但老 prompt 仍可能带上；必须吃掉，
+        # 免得它被当成未知参数传进原函数。
+        legacy = kwargs.pop(_LEGACY_WIDGET_NAME, None)
+        mode = _normalize_mode(raw_mode)
+        if raw_mode is None and legacy is not None:
+            mode = _normalize_mode(legacy)  # True -> 有音频，False -> 都保存
+        # 开关生效却什么都没清：接了 audio 说明是补丁失效（对方改了输出形态），
         # 没接 audio 则本来就只有份无声视频，属正常，不该刷屏
         had_audio = kwargs.get("audio") is not None
         result = original_combine(self, *args, **kwargs)
-        # 兼容 ComfyUI 前端把 BOOLEAN 传成字符串 "true"/"false"
-        if isinstance(keep_audio_only, str):
-            keep_audio_only = keep_audio_only.strip().lower() in ("true", "1", "on")
-        if not keep_audio_only or not isinstance(result, dict):
+        if mode == MODE_ALL or not isinstance(result, dict):
             return result
-        removed = _drop_silent(result)
-        if removed:
-            print(f"{LOG_PREFIX} 已删除无声副本：{os.path.basename(removed)}", flush=True)
-        elif had_audio:
-            print(f"{LOG_PREFIX} 开关已打开但未找到无声副本，输出形态可能变了。", flush=True)
+        if not _keep_only(result, mode == MODE_WITH_AUDIO) and had_audio:
+            print(
+                f"{LOG_PREFIX} 已选择「{mode}」但未找到成对的视频产物（可能没接有效 audio、"
+                "当前格式不带音轨，或 VHS 改了输出形态），本次不清理。",
+                flush=True,
+            )
         return result
 
     cls.combine_video = combine_video
     setattr(cls, _PATCHED_FLAG, True)
-    print(f"{LOG_PREFIX} 已为 Video Combine 安装 only_save_with_audio 开关。", flush=True)
+    print(f"{LOG_PREFIX} 已为 Video Combine 安装 save_audio_mode 选项"
+          "（都保存 / 无音频 / 有音频）。", flush=True)
     return True
 
 
@@ -168,5 +240,5 @@ def apply_patch():
     try:
         return _install(cls)
     except Exception as e:
-        print(f"{LOG_PREFIX} 开关注入失败，已跳过（不影响正常使用）: {e}", flush=True)
+        print(f"{LOG_PREFIX} 选项注入失败，已跳过（不影响正常使用）: {e}", flush=True)
         return False

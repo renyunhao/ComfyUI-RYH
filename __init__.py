@@ -17,7 +17,8 @@
 - H3DirectorBusDoctor：自检补丁状态、快照内容与本次回写记录。
 
 第三方节点补丁（不改对方源文件，默认保持原版行为）：
-- Video Combine 🎥🅥🅗🅢：注入 only_save_with_audio 开关，打开后只保留带音频那份视频。
+- Video Combine 🎥🅥🅗🅢：注入 save_audio_mode 选项（都保存 / 无音频 / 有音频），
+  接了 audio 时控制只保留哪份视频，输出与预览同步收敛；旧布尔开关会自动迁移。
 - comfyui-llama-TE / XB_ToolBox 反推节点：注入「缓存控制」口 + 懒加载（见 caption_cache）。
 - MiniMaxH3 导演台：注入 h3_bus 回传口 + plan 快照（见 h3_segment_bus）。
 
@@ -282,19 +283,19 @@ async def _on_startup_apply_vhs(_app):
     try:
         vhs_save_policy.apply_patch()
     except Exception as e:
-        print(f"[ComfyUI-RYH] Video Combine 开关 patch 安装失败，已跳过（不影响正常使用）: {e}")
+        print(f"[ComfyUI-RYH] Video Combine 保存选项 patch 安装失败，已跳过（不影响正常使用）: {e}")
 
 
 def _install_vhs_save_policy():
-    """给 VHS 的 Video Combine 注入开关，同样要等第三方节点加载完。"""
+    """给 VHS 的 Video Combine 注入保存选项，同样要等第三方节点加载完。"""
     try:
         PromptServer.instance.app.on_startup.append(_on_startup_apply_vhs)
     except Exception as e:
-        print(f"[ComfyUI-RYH] on_startup 注册失败，直接尝试安装 VHS 开关: {e}")
+        print(f"[ComfyUI-RYH] on_startup 注册失败，直接尝试安装 VHS 保存选项: {e}")
         try:
             vhs_save_policy.apply_patch()
         except Exception as e2:
-            print(f"[ComfyUI-RYH] VHS 开关 patch 安装失败，已跳过（不影响正常使用）: {e2}")
+            print(f"[ComfyUI-RYH] VHS 保存选项 patch 安装失败，已跳过（不影响正常使用）: {e2}")
 
 
 _install_caption_cache()
