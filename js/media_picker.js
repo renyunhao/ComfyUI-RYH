@@ -4,6 +4,11 @@ import { api } from "../../scripts/api.js";
 // ComfyUI-RYH · 全屏媒体选择器（可复用）
 // 目录树 + 搜索 + 虚拟滚动列表/缩略图 + 预览，服务端出缩略图。
 // 用法：openMediaPicker({ root, kind, current, title }) -> Promise<{relPath,name,kind}|null>
+//
+// 「选择」与「查看」分离（对齐 comfyui-lumi-batcher 的 ImagePicker 迭代）：
+// · 缩略图区点击 = 选中（同时把大图切到该文件）；文件名条点击 = 只看大图，不改选中
+// · 切目录 / 搜索不再清掉已选文件，浏览途中不会把结果改成别的文件
+// · 弹窗宽高按视口百分比铺开，三栏宽度随屏幕宽度伸缩
 // ============================================================
 
 const isZH = navigator.language.startsWith("zh");
@@ -11,7 +16,11 @@ const VIEW_KEY = "ComfyUI-RYH.mediaPicker.view";
 const ROW_H = 30;
 const CARD_GAP = 8;
 const CARD_MIN = 132;
-const THUMB_SIZE = 160;
+// 弹窗按视口铺开后卡片也跟着变大，缩略图给足像素，高分屏下不发虚
+const THUMB_SIZE = 224;
+// 卡片：缩略图区是正方形，文件名条固定占这么高，卡片高度不再靠猜测补 28px
+const CARD_PAD = 4;
+const CARD_NAME_H = 26;
 
 const L = {
     viewList: isZH ? "列表" : "List",
@@ -38,11 +47,19 @@ const L = {
     video: isZH ? "视频" : "video",
     audio: isZH ? "音频" : "audio",
     all: isZH ? "全部" : "All",
+    selectHint: isZH ? "点击选中" : "Click to select",
+    viewHint: isZH ? "点击查看大图，不选中" : "Preview only, does not select",
+    viewOnly: isZH ? "仅查看，未选中 · 仍将使用 {n}" : "Viewing only · will still use {n}",
+    picked: isZH ? "已选：" : "Selected: ",
+    hintThumbs: isZH
+        ? "缩略图区点击选中 · 文件名条点击只看大图"
+        : "Thumbnail selects · name previews only",
+    hintList: isZH ? "单击选中 · 双击直接使用 · ↑↓ 切换" : "Click selects · double-click uses · ↑↓ moves",
 };
 
 const CSS = `
-.ryh-pick-overlay{position:fixed;inset:0;z-index:10000;padding:16px;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;box-sizing:border-box}
-.ryh-pick{width:min(1180px,94vw);height:min(840px,92vh);background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:12px;box-sizing:border-box;display:flex;flex-direction:column;gap:10px;color:#ddd;font-size:11px;box-shadow:0 10px 28px rgba(0,0,0,.5)}
+.ryh-pick-overlay{position:fixed;inset:0;z-index:10000;padding:clamp(8px,1.2vw,24px);background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;box-sizing:border-box}
+.ryh-pick{width:90vw;height:88vh;background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:12px;box-sizing:border-box;display:flex;flex-direction:column;gap:10px;color:#ddd;font-size:11px;box-shadow:0 10px 28px rgba(0,0,0,.5)}
 .ryh-pick-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap}
 .ryh-pick-title{flex:0 1 auto;min-width:0;padding-top:4px;color:#e6e6e6;font-size:12px;font-weight:600;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ryh-pick-search{display:flex;align-items:center;gap:8px;flex:1 1 300px;min-width:0;justify-content:flex-end}
@@ -54,10 +71,15 @@ const CSS = `
 .ryh-pick-btn{appearance:none;background:#2a2a2a;border:1px solid #3a3a3a;border-radius:6px;color:#ddd;padding:4px 10px;font-size:11px;font-family:inherit;line-height:1.5;cursor:pointer;white-space:nowrap}
 .ryh-pick-btn:hover{background:#333;border-color:#4a4a4a;color:#fff}
 .ryh-pick-btn.active{border-color:#6aa9ff;color:#6aa9ff}
+.ryh-pick-btn[disabled]{opacity:.45;cursor:not-allowed}
 .ryh-pick-btn.primary{background:#2f6fd0;border-color:#3b7fdf;color:#fff}
 .ryh-pick-btn.primary:hover{background:#3a7ce0;border-color:#4b90ef}
+.ryh-pick-btn.primary[disabled]{background:#2a3f5a;border-color:#33506e;color:#9fb4c9}
+.ryh-pick-status-row{display:flex;align-items:baseline;justify-content:space-between;gap:10px;min-height:15px}
 .ryh-pick-status{color:#999;font-size:11px;line-height:1.4;min-height:15px}
-.ryh-pick-body{display:grid;grid-template-columns:190px minmax(0,1fr) minmax(260px,380px);gap:10px;flex:1 1 auto;min-height:0}
+.ryh-pick-tip{color:#6f6f6f;font-size:10px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ryh-pick-picked{flex:1 1 auto;min-width:0;align-self:center;padding-right:8px;color:#8a9aab;font-size:10px;line-height:1.35;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ryh-pick-body{display:grid;grid-template-columns:clamp(180px,11vw,260px) minmax(0,1fr) clamp(260px,24vw,560px);gap:10px;flex:1 1 auto;min-height:0}
 .ryh-pick-tree{display:flex;flex-direction:column;gap:1px;min-height:0;overflow:auto;background:#141414;border:1px solid #333;border-radius:6px;padding:6px;scrollbar-width:thin;scrollbar-color:#3a3a3a transparent}
 .ryh-pick-node{appearance:none;display:flex;align-items:center;gap:4px;width:100%;background:transparent;border:1px solid transparent;border-radius:4px;color:#c8c8c8;font:inherit;font-size:11px;line-height:1.35;padding:4px 6px;text-align:left;cursor:pointer;min-width:0}
 .ryh-pick-node:hover{background:#202020;color:#eee}
@@ -90,6 +112,7 @@ const CSS = `
 .ryh-pick-vspace{position:relative;width:100%}
 .ryh-pick-row{position:absolute;left:0;right:0;height:30px;box-sizing:border-box;display:grid;grid-template-columns:minmax(0,1fr) 104px 128px;align-items:center;cursor:pointer;border-bottom:1px solid #262626;color:#ddd;font-size:11px;line-height:1.35}
 .ryh-pick-row:hover{background:#222}
+.ryh-pick-row.active{background:#1b2432}
 .ryh-pick-row.selected{background:#2c3550}
 .ryh-pick-cell{padding:0 10px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ryh-pick-cell.name{color:#eee}
@@ -101,16 +124,29 @@ const CSS = `
 .ryh-pick-preview audio{display:block;width:calc(100% - 20px)}
 .ryh-pick-preview .hint{padding:18px;color:#666;font-size:11px;line-height:1.45;text-align:center}
 .ryh-pick-meta{display:flex;flex-direction:column;gap:4px;color:#9a9a9a;font-size:10px;line-height:1.45;word-break:break-all;flex-shrink:0}
-.ryh-pick-card{position:absolute;box-sizing:border-box;appearance:none;min-width:0;padding:4px;background:#161616;border:1px solid #333;border-radius:6px;color:#ddd;cursor:pointer;text-align:left;font:inherit;overflow:hidden}
-.ryh-pick-card:hover,.ryh-pick-card.selected{border-color:#6aa9ff;background:#1b2333}
+.ryh-pick-meta .view-only{color:#d8b25e}
+.ryh-pick-card{position:absolute;box-sizing:border-box;min-width:0;padding:4px;background:#161616;border:1px solid #333;border-radius:6px;color:#ddd;display:flex;flex-direction:column;overflow:hidden}
+.ryh-pick-card:hover{border-color:#4a6a8a}
+.ryh-pick-card.selected{border-color:#6aa9ff;background:#1b2333}
+.ryh-pick-card.is-active:not(.selected){border-color:#6aa9ff;border-style:dashed}
+.ryh-pick-card-select{appearance:none;display:block;position:relative;width:100%;min-width:0;margin:0;padding:0;border:none;background:transparent;font:inherit;cursor:pointer;flex-shrink:0;overflow:hidden;border-radius:4px}
+.ryh-pick-card-select:hover img{outline:2px solid #6aa9ff;outline-offset:-2px}
 .ryh-pick-card img{display:block;width:100%;object-fit:contain;background:#0b0b0b;border-radius:4px}
-.ryh-pick-card .badge{position:absolute;right:8px;width:18px;height:18px;border-radius:9px;background:rgba(0,0,0,.55);color:#fff;font-size:9px;line-height:18px;text-align:center;pointer-events:none}
-.ryh-pick-card-name{display:block;padding:4px 2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:1.35}
+.ryh-pick-card .badge{position:absolute;right:6px;bottom:6px;width:18px;height:18px;border-radius:9px;background:rgba(0,0,0,.6);color:#fff;font-size:9px;line-height:18px;text-align:center;pointer-events:none}
+.ryh-pick-card .check{display:none;position:absolute;right:6px;top:6px;width:16px;height:16px;border-radius:8px;background:#2f6fd0;color:#fff;font-size:10px;line-height:16px;text-align:center;pointer-events:none}
+.ryh-pick-card.selected .check{display:block}
+.ryh-pick-card-view{appearance:none;display:block;width:100%;min-width:0;margin-top:2px;padding:3px 2px 2px;border:none;border-top:1px solid #262626;background:transparent;color:inherit;font:inherit;text-align:left;cursor:zoom-in;flex-shrink:0}
+.ryh-pick-card-view:hover{background:#1b2333;color:#6aa9ff}
+.ryh-pick-card-name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:1.35}
+@media(max-width:1100px){
+.ryh-pick-body{grid-template-columns:clamp(160px,15vw,200px) minmax(0,1fr) clamp(220px,26vw,320px)}
+}
 @media(max-width:768px){
 .ryh-pick-body{grid-template-columns:minmax(0,1fr)}
 .ryh-pick-tree,.ryh-pick-right{display:none}
 .ryh-pick-thead,.ryh-pick-row{grid-template-columns:minmax(0,1fr) 72px 108px}
 .ryh-pick-cell,.ryh-pick-th{padding-left:8px;padding-right:8px}
+.ryh-pick-tip{display:none}
 }
 `;
 
@@ -264,7 +300,10 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
                 </div>
                 <div class="ryh-pick-actions"></div>
             </div>
-            <div class="ryh-pick-status"></div>
+            <div class="ryh-pick-status-row">
+                <div class="ryh-pick-status"></div>
+                <div class="ryh-pick-tip"></div>
+            </div>
             <div class="ryh-pick-body">
                 <div class="ryh-pick-tree"></div>
                 <div class="ryh-pick-left">
@@ -298,6 +337,7 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
         const metaEl = panel.querySelector(".ryh-pick-meta");
         const searchInput = panel.querySelector(".ryh-pick-q");
         const scopeAllEl = panel.querySelector(".ryh-pick-scope-all");
+        const tipEl = panel.querySelector(".ryh-pick-tip");
 
         const rowsHost = document.createElement("div");
         rowsHost.className = "ryh-pick-vspace";
@@ -327,7 +367,10 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
         let treeNodes = [];
         let rowsView = [];
         let rowsStamp = 0;
+        /** 已确认的选中项：只有点缩略图 / 列表行才会改，浏览途中保持不变 */
         let selectedValue = current || "";
+        /** 正在预览的项：点文件名条只动这个，不动 selectedValue */
+        let activeValue = current || "";
         // 首次打开把当前目录在树里居中；之后只最小幅度滚动，避免点目录时整棵树跳动
         let pendingTreeCenter = !!startRel;
         let loadSeq = 0;
@@ -335,7 +378,7 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
         let cardEls = new Map();
         let rowsKey = "";
         let cardsKey = "";
-        let grid = { cols: 4, cardW: 150, cardH: 130 };
+        let grid = { cols: 4, cardW: 150, cardH: 150 };
         let rafId = 0;
         let searchTimer = 0;
         let metaTimer = 0;
@@ -356,12 +399,18 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
             resolve(value);
         };
 
+        const nameOf = (relPath) => String(relPath || "").split("/").pop() || "";
+
         const selectedItem = () => itemsByPath.get(selectedValue || "") || null;
+        const activeItem = () => itemsByPath.get(activeValue || "") || null;
 
         const commit = () => {
+            // 选中项可能不在当前目录（浏览途中切走了），只要有路径就能提交，
+            // 名字和类型从路径推导即可，不必依赖当前列表
+            if (!selectedValue) return;
             const item = selectedItem();
-            if (!item) return;
-            finish({ relPath: item.relPath, name: item.name, kind: mediaKindOf(item.name) });
+            const name = item?.name || nameOf(selectedValue);
+            finish({ relPath: selectedValue, name, kind: mediaKindOf(name) });
         };
 
         const parentOf = (relPath) => {
@@ -450,14 +499,25 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
                 info.textContent = `${L.info}: ${infoText(item, meta)}`;
                 metaEl.appendChild(info);
             }
+            // 只是「查看」而已：把这条写清楚，免得以为已经改掉了选中项
+            if (selectedValue && item.relPath !== selectedValue) {
+                const note = document.createElement("div");
+                note.className = "view-only";
+                note.textContent = L.viewOnly.replace("{n}", nameOf(selectedValue));
+                metaEl.appendChild(note);
+            }
         };
 
         const applySelection = () => {
             for (const [idx, el] of rowEls) {
-                el.classList.toggle("selected", rowsView[idx]?.relPath === selectedValue);
+                const path = rowsView[idx]?.relPath;
+                el.classList.toggle("selected", path === selectedValue);
+                el.classList.toggle("active", !!path && path === activeValue && path !== selectedValue);
             }
             for (const [idx, el] of cardEls) {
-                el.classList.toggle("selected", rowsView[idx]?.relPath === selectedValue);
+                const path = rowsView[idx]?.relPath;
+                el.classList.toggle("selected", path === selectedValue);
+                el.classList.toggle("is-active", !!path && path === activeValue && path !== selectedValue);
             }
         };
 
@@ -474,8 +534,9 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
             const innerW = Math.max(1, galleryEl.clientWidth - 16);
             const cols = Math.max(1, Math.floor((innerW + CARD_GAP) / (CARD_MIN + CARD_GAP)));
             const cardW = Math.max(96, Math.floor((innerW - CARD_GAP * (cols - 1)) / cols));
-            // 缩略图等比完整显示（contain），正方形格子对竖图/横图都最划算
-            return { cols, cardW, cardH: cardW + 28 };
+            // 卡片高度 = 正方形缩略图区（宽度减左右内边距）+ 文件名条，
+            // 不再用 cardW+28 这种估算值：竖图/横图都不会把卡片撑成扁框
+            return { cols, cardW, cardH: cardW + CARD_NAME_H };
         };
 
         const requestMeta = () => {
@@ -501,7 +562,8 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
                         const cell = rowEls.get(i)?.querySelector(".ryh-pick-cell.info");
                         if (item && cell) cell.textContent = infoText(item, metaOf(item));
                     }
-                    const current = selectedItem();
+                    // 信息补全后刷新的是正在预览的那一项（可能只是查看、并未选中）
+                    const current = activeItem();
                     if (current) renderPreview(current);
                 }).catch(() => {});
             }, 120);
@@ -575,18 +637,24 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
             cardsKey = key;
             cardsHost.textContent = "";
             cardEls = new Map();
-            const thumbH = grid.cardH - 28;
+            const thumbH = Math.max(48, grid.cardW - CARD_PAD * 2);
             for (let i = start; i < end; i++) {
                 const item = rowsView[i];
                 const kindOfFile = mediaKindOf(item.name);
-                const card = document.createElement("button");
-                card.type = "button";
+                // 卡片本身不再是按钮：上半选中、下半仅查看，两个独立点击区
+                const card = document.createElement("div");
                 card.className = "ryh-pick-card";
                 card.dataset.path = item.relPath;
                 card.style.left = `${(i % grid.cols) * (grid.cardW + CARD_GAP)}px`;
                 card.style.top = `${Math.floor(i / grid.cols) * rowH}px`;
                 card.style.width = `${grid.cardW}px`;
                 card.style.height = `${grid.cardH}px`;
+
+                const pickBtn = document.createElement("button");
+                pickBtn.type = "button";
+                pickBtn.className = "ryh-pick-card-select";
+                pickBtn.title = `${item.relPath} — ${L.selectHint}`;
+                pickBtn.setAttribute("aria-label", L.selectHint);
                 const img = document.createElement("img");
                 img.style.height = `${thumbH}px`;
                 img.alt = "";
@@ -595,21 +663,32 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
                 img.addEventListener("error", () => {
                     img.removeAttribute("src");
                 });
-                card.appendChild(img);
+                pickBtn.appendChild(img);
                 if (kindOfFile !== "image") {
                     const badge = document.createElement("span");
                     badge.className = "badge";
-                    badge.style.bottom = `${grid.cardH - thumbH + 12}px`;
                     badge.textContent = kindOfFile === "video" ? "▶" : "♪";
-                    card.appendChild(badge);
+                    pickBtn.appendChild(badge);
                 }
+                const check = document.createElement("span");
+                check.className = "check";
+                check.textContent = "✓";
+                pickBtn.appendChild(check);
+                pickBtn.addEventListener("click", () => select(item));
+                pickBtn.addEventListener("dblclick", commit);
+
+                const viewBtn = document.createElement("button");
+                viewBtn.type = "button";
+                viewBtn.className = "ryh-pick-card-view";
+                viewBtn.title = `${item.relPath} — ${L.viewHint}`;
+                viewBtn.setAttribute("aria-label", L.viewHint);
                 const name = document.createElement("span");
                 name.className = "ryh-pick-card-name";
                 name.textContent = query ? item.relPath : item.name;
-                name.title = item.relPath;
-                card.appendChild(name);
-                card.addEventListener("click", () => select(item));
-                card.addEventListener("dblclick", commit);
+                viewBtn.appendChild(name);
+                viewBtn.addEventListener("click", () => viewOnly(item));
+
+                card.append(pickBtn, viewBtn);
                 cardsHost.appendChild(card);
                 cardEls.set(i, card);
             }
@@ -641,8 +720,8 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
             galleryEl.classList.add("is-empty");
         };
 
-        const scrollIntoView = ({ center = false } = {}) => {
-            const idx = rowsView.findIndex((item) => item.relPath === selectedValue);
+        const scrollIntoView = ({ center = false, value = selectedValue } = {}) => {
+            const idx = rowsView.findIndex((item) => item.relPath === value);
             if (idx < 0) return;
             const place = () => {
                 if (view === "thumbs") {
@@ -673,14 +752,24 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
             paint();
         };
 
+        /** 选中：同时把大图切过去。只在真的换了文件时重绘预览，免得视频被反复重载 */
         function select(item, { scroll = false } = {}) {
             if (!item) return;
-            if (item.relPath !== selectedValue) {
-                selectedValue = item.relPath;
-                applySelection();
-                renderPreview(item);
-            }
+            const needPreview = item.relPath !== activeValue;
+            selectedValue = item.relPath;
+            activeValue = item.relPath;
+            applySelection();
+            if (needPreview) renderPreview(item);
+            updatePicked();
             if (scroll) scrollIntoView();
+        }
+
+        /** 仅查看：只把大图切过去，选中项一个字节都不动 */
+        function viewOnly(item) {
+            if (!item || item.relPath === activeValue) return;
+            activeValue = item.relPath;
+            applySelection();
+            renderPreview(item);
         }
 
         const moveSelection = (delta) => {
@@ -823,8 +912,13 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
                 treeNodes = data.tree;
                 if (!query) expandAncestors(dir);
                 applySort();
-                if (!itemsByPath.has(selectedValue)) {
-                    selectedValue = rowsView[0]?.relPath || "";
+                // 浏览不等于改选：切目录 / 搜索时保留已选文件，
+                // 只有从来没选过才落到当前列表第一项；预览则跟着当前目录走
+                if (!selectedValue) selectedValue = rowsView[0]?.relPath || "";
+                if (!itemsByPath.has(activeValue)) {
+                    activeValue = itemsByPath.has(selectedValue)
+                        ? selectedValue
+                        : (rowsView[0]?.relPath || "");
                 }
                 syncHeader();
                 renderTree({ reveal: true, center: pendingTreeCenter });
@@ -835,11 +929,12 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
                     renderPreview(null);
                 } else {
                     renderBrowser();
-                    renderPreview(selectedItem());
-                    // 打开时把当前文件滚到视野中间，而不是停在列表顶部
-                    scrollIntoView({ center: true });
+                    renderPreview(activeItem());
+                    // 打开时把正在看的文件滚到视野中间，而不是停在列表顶部
+                    scrollIntoView({ center: true, value: activeValue });
                 }
                 updateStatus(data);
+                updatePicked();
             } catch (err) {
                 if (seq !== loadSeq) return;
                 items = [];
@@ -855,6 +950,8 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
             leftEl.classList.toggle("is-thumbs", view === "thumbs");
             listBtn.classList.toggle("active", view === "list");
             thumbsBtn.classList.toggle("active", view === "thumbs");
+            // 两种视图的点击含义不一样，提示跟着一起换
+            tipEl.textContent = view === "thumbs" ? L.hintThumbs : L.hintList;
         };
 
         thEls.forEach((th) => {
@@ -914,7 +1011,7 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
             rowsKey = "";
             cardsKey = "";
             renderBrowser();
-            scrollIntoView({ center: true });
+            scrollIntoView({ center: true, value: activeValue });
             if (view === "thumbs") galleryEl.focus();
             else tableEl.focus();
         };
@@ -943,8 +1040,19 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
         okBtn.className = "ryh-pick-btn primary";
         okBtn.textContent = L.use;
         okBtn.addEventListener("click", commit);
-        actionsBottom.append(cancelBtn, okBtn);
+        // 选中项可能已经被浏览到别的目录去了，页脚固定显示「将使用哪个」
+        const pickedEl = document.createElement("span");
+        pickedEl.className = "ryh-pick-picked";
+        actionsBottom.append(pickedEl, cancelBtn, okBtn);
         panel.appendChild(actionsBottom);
+
+        function updatePicked() {
+            const value = selectedValue || "";
+            okBtn.disabled = !value;
+            okBtn.title = value ? `${L.use} · ${value}` : "";
+            pickedEl.textContent = value ? `${L.picked}${value}` : "";
+            pickedEl.title = value;
+        }
 
         overlay.addEventListener("click", (e) => {
             if (e.target === overlay) finish(null);
@@ -1001,6 +1109,7 @@ export function openMediaPicker({ root, kind = "all", current = "", title = "" }
         renderTree();
         renderCrumbs();
         renderPreview(null);
+        updatePicked();
         void load();
         if (view === "thumbs") galleryEl.focus();
         else tableEl.focus();
