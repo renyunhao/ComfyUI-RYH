@@ -1,0 +1,43 @@
+# RYH MMAudio Segmented 节点 · 依赖记录
+#
+# 目标环境：D:\AI\ComfyUI_windows_portable\python_embeded\python.exe (Python 3.13.9)
+# 用途：在 ComfyUI 进程内直接 import D:\AI\NSFW_MMaudio\mmaudio 跑推理，
+#       不启动子进程、不复制 mmaudio 源码、不转换权重。
+#
+# ============ 2026-11-15 实际安装的包 ============
+# 命令（--no-deps 防止 pip 改动已有的 torch 2.13.0+cu132）：
+#   python_embeded\python.exe -m pip install --no-deps colorlog==6.12.0 torchdiffeq==0.2.5
+#
+colorlog==6.12.0       # mmaudio/eval_utils.py 顶层 import colorlog（ColoredFormatter）
+torchdiffeq==0.2.5     # mmaudio/model/flow_matching.py 顶层 from torchdiffeq import odeint
+                       # 注：推理用 euler 模式其实不调用 odeint，但顶层 import 必须能解析
+#
+# ============ 环境自带、未改动（安装当日实测版本）============
+# torch                 2.13.0+cu132
+# torchvision           0.28.0+cu132
+# open_clip_torch       3.2.0
+# librosa               0.11.0
+# soundfile             0.13.1
+# accelerate            1.12.0
+# av                    18.0.0
+# omegaconf             2.3.0
+# einops                0.8.2
+# timm                  1.0.22
+# ftfy                  6.3.1
+# numpy / torchaudio    自带
+#
+# ============ 权重（2026-11-15 已复制进 ComfyUI 规范目录）============
+# 目标：D:\AI\ComfyUI_windows_portable\ComfyUI\models\mmaudio
+#   nsfw_gold_8.5k_final.pth        4120180037 B  主模型 large_44k
+#   v1-44.pth                       1221942998 B  VAE
+#   synchformer_state_dict.pth       950058171 B  Synchformer
+# 来源（原文件保留，供 Gradio/CLI 版继续用）：
+#   D:\AI\NSFW_MMaudio\nsfw_gold_8.5k_final.pth
+#   D:\AI\NSFW_MMaudio\ext_weights\v1-44.pth
+#   D:\AI\NSFW_MMaudio\ext_weights\synchformer_state_dict.pth
+# 三份均逐字节大小校验 MATCH；节点下拉只扫 models\mmaudio，不再读项目旧路径。
+# 往该目录新增权重后需重启 ComfyUI 刷新下拉，或用 checkpoint_path_override 填绝对路径。
+#
+# 注意：CLIP (apple/DFN5B-CLIP-ViT-H-14-384) 与 BigVGAN
+# (nvidia/bigvgan_v2_44khz_128band_512x) 仍由 open_clip / torch.hub 从
+# HuggingFace 本地 cache 加载，首次运行需缓存已存在或能联网。

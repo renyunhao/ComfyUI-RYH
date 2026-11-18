@@ -15,6 +15,8 @@
 - H3DirectorSegmentPromptOverride / H3DirectorSegmentListPromptOverride：改完通过导演台新增的
   h3_bus 输入口回写，一次 Queue 即生效。
 - H3DirectorBusDoctor：自检补丁状态、快照内容与本次回写记录。
+- MMAudio Segmented：直接用上游 IMAGE 序列分段生成音轨（不落盘、不调 ffmpeg），
+  输出原生 AUDIO 可接 VHS VideoCombine；依赖记录见 requirements-mmaudio.txt。
 
 第三方节点补丁（不改对方源文件，默认保持原版行为）：
 - Video Combine 🎥🅥🅗🅢：注入 save_audio_mode 选项（都保存 / 无音频 / 有音频），
@@ -40,6 +42,7 @@ from . import caption_cache
 from .caption_cache import CaptionCachePolicy
 from . import vhs_save_policy
 from .h3_prompt_spy import H3DirectorPromptSpy
+from .mmaudio_nodes import RYH_MMAudioSegmented
 from .h3_segment_bus import (
     H3DirectorBusDoctor,
     H3DirectorSegment,
@@ -62,6 +65,7 @@ NODE_CLASS_MAPPINGS = {
     "H3DirectorSegmentPromptOverride": H3DirectorSegmentPromptOverride,
     "H3DirectorSegmentListPromptOverride": H3DirectorSegmentListPromptOverride,
     "H3DirectorBusDoctor": H3DirectorBusDoctor,
+    "RYH_MMAudioSegmented": RYH_MMAudioSegmented,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -78,6 +82,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3DirectorSegmentPromptOverride": "H3Director Segment Prompt Override (RYH)",
     "H3DirectorSegmentListPromptOverride": "H3Director Segment List Prompt Override (RYH)",
     "H3DirectorBusDoctor": "H3Director Bus Doctor (RYH)",
+    "RYH_MMAudioSegmented": "MMAudio Segmented (RYH)",
 }
 
 WEB_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js")
